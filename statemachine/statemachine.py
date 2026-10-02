@@ -30,6 +30,8 @@ from .graph import iterate_states_and_transitions
 from .i18n import _
 from .model import Model
 from .signature import SignatureAdapter
+from .snapshot import restore as _restore_snapshot
+from .snapshot import take_snapshot
 from .state import InstanceState
 from .utils import run_async_from_sync
 
@@ -509,6 +511,41 @@ class StateChart(Generic[TModel], metaclass=StateMachineMetaclass):
     def cancel_event(self, send_id: str):
         """Cancel all the delayed events with the given ``send_id``."""
         self._engine.cancel_event(send_id)
+
+    def snapshot(
+        self, model_fields: "list[str] | tuple[str, ...] | None" = None
+    ) -> dict[str, Any]:
+        """Export a stable configuration of this machine as a JSON-safe dict.
+
+        Only quiescent machines (no running callback, empty event queues, no
+        active invocation) can be snapshotted. See
+        :mod:`statemachine.snapshot` for the document format and semantics.
+
+        Args:
+            model_fields: Optional allowlist of ``self.model`` attribute names
+                to include. Their values must be JSON-native.
+
+        Raises:
+            SnapshotNotStable: The machine is currently busy.
+            SnapshotError: An allowlisted value is not JSON-serializable.
+        """
+        return take_snapshot(self, model_fields=model_fields)
+
+    @classmethod
+    def restore(
+        cls,
+        snapshot: "dict[str, Any] | str | bytes",
+        model: Any = None,
+        listeners: "list[object] | None" = None,
+    ) -> "StateChart":
+        """Restore a machine from a document produced by :meth:`snapshot`.
+
+        The document is fully validated (version, definition fingerprint,
+        state ids, parent/child and parallel-region constraints) before the
+        machine is instantiated, so restore never runs entry/exit actions and
+        never guesses a missing state as an initial state.
+        """
+        return _restore_snapshot(cls, snapshot, model=model, listeners=listeners)
 
     @property
     def is_terminated(self):

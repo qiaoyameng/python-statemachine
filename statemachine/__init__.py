@@ -1,4 +1,8 @@
 from .event import Event
+from .snapshot import restore_snapshot
+from .snapshot import SnapshotDefinitionMismatch
+from .snapshot import SnapshotError
+from .snapshot import SnapshotNotStable
 from .state import HistoryState
 from .state import HistoryType
 from .state import State
@@ -18,4 +22,8 @@ __all__ = [
     "HistoryType",
     "Event",
     "TModel",
+    "restore_snapshot",
+    "SnapshotError",
+    "SnapshotNotStable",
+    "SnapshotDefinitionMismatch",
 ]
