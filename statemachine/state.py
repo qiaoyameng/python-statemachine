@@ -14,6 +14,7 @@ from .exceptions import InvalidDefinition
 from .i18n import _
 from .invoke import normalize_invoke_callbacks
 from .transition import Transition
+from .state_data import StateLocalData
 from .transition_list import TransitionList
 from .utils import humanize_id
 
@@ -77,6 +78,7 @@ class NestedStateFactory(type):
         states = []
         history = []
         callbacks = {}
+        local_data = StateLocalData()
         # Order is significant: a ``HistoryState`` is a ``State``, and an ``Event`` is a
         # callable ``str``, so both would be captured by a later branch.
         for key, value in attrs.items():
@@ -90,6 +92,8 @@ class NestedStateFactory(type):
             elif isinstance(value, State):
                 value._set_id(key)
                 states.append(value)
+            elif isinstance(value, StateLocalData):
+                local_data = local_data.add(value)
             elif isinstance(value, TransitionList):
                 value.add_event(_expand_event_id(key))
             elif isinstance(value, Event):
@@ -110,9 +114,18 @@ class NestedStateFactory(type):
             elif callable(value):
                 callbacks[key] = value
 
-        return State(
-            name=name, states=states, history=history, _callbacks=callbacks, **inherited_kwargs
+        state = State(
+            name=name,
+            states=states,
+            history=history,
+            local_data=local_data,
+            _callbacks=callbacks,
+            **inherited_kwargs,
         )
+        for child in states:
+            child.parent = state
+            setattr(state, child.id, child)
+        return state
 
     @classmethod
     def to(cls, *args: "State | NestedStateFactory", **kwargs) -> "_ToState":  # pragma: no cover
@@ -233,6 +246,7 @@ class State:
         parallel: bool = False,
         states: "list[State] | None" = None,
         history: "list[HistoryState] | None" = None,
+        local_data: StateLocalData | None = None,
         enter: Any = None,
         exit: Any = None,
         invoke: Any = None,
@@ -249,6 +263,7 @@ class State:
         self._final = final
         self.is_active = False
         self._id: str = ""
+        self.local_data = local_data or StateLocalData()
         self._callbacks = _callbacks
         self.parent: "State | None" = None
         self.transitions = TransitionList()

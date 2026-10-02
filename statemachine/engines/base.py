@@ -97,6 +97,35 @@ class BaseEngine:
         self._debug = logger.debug if logger.isEnabledFor(logging.DEBUG) else lambda *a, **k: None
         self._root_parallel_final_pending: "State | None" = None
 
+    def _state_data_release(self, state: State) -> None:
+        self.sm._state_data.release(state)
+
+    def _state_data_build_sync(self, state: State, transition: Transition | None = None):
+        canonical = self.sm._state_data.resolve_state(state)
+        existing = self.sm._state_data.frames.get(canonical)
+        if existing is None:
+            return self.sm._state_data.build(canonical)
+        released = not existing.active
+        if existing is not None and not released:
+            return existing
+        reentered = (
+            transition is not None
+            and not transition.internal
+            and released
+            and self._active_state_for_transition(transition).id == canonical.id
+            and canonical in self._transition_targets_state_data(transition)
+        )
+        if reentered:
+            existing.close()
+            return self.sm._state_data.build(canonical)
+        return existing
+
+    def _active_state_for_transition(self, transition: Transition) -> State:
+        return self.sm._state_data.resolve_state(transition.source)
+
+    def _transition_targets_state_data(self, transition: Transition) -> list[State]:
+        return [self.sm._state_data.resolve_state(target) for target in transition.targets]
+
     def empty(self):  # pragma: no cover
         return self.external_queue.is_empty()
 
@@ -392,9 +421,11 @@ class BaseEngine:
                 transitions, trigger_data, states_to_exit, previous_configuration
             )
         except InvalidDefinition:
+            self.sm._state_data.discard_transient_frames()
             self.sm.configuration = previous_configuration
             raise
         except Exception as e:
+            self.sm._state_data.discard_transient_frames()
             self.sm.configuration = previous_configuration
             self._handle_error(e, trigger_data)
             return None
@@ -518,6 +549,8 @@ class BaseEngine:
                 self._debug("%s Exiting state: %s", self._log_id, info.state)
                 self.sm._callbacks.call(info.state.exit.key, *args, on_error=on_error, **kwargs)
 
+            canonical = self.sm._state_data.resolve_state(info.state)
+            self._state_data_release(canonical)
             self._remove_state_from_configuration(info.state)
 
         return result
@@ -642,6 +675,7 @@ class BaseEngine:
     ):
         """Enter the states as determined by the given transitions."""
         on_error = self._on_error_handler()
+        self.sm._state_data.begin_transient_frames()
         ordered_states, states_for_default_entry, default_history_content, new_configuration = (
             self._prepare_entry_states(enabled_transitions, states_to_exit, previous_configuration)
         )
@@ -671,9 +705,14 @@ class BaseEngine:
         if self.sm.atomic_configuration_update:
             self.sm.configuration = new_configuration
 
+        built_targets: set[str] = set()
         for info in ordered_states:
             target = info.state
             transition = info.transition
+            canonical_target = self.sm._state_data.resolve_state(target)
+            if canonical_target.id not in built_targets:
+                self._state_data_build_sync(target, transition)
+                built_targets.add(canonical_target.id)
             args, kwargs = self._get_args_kwargs(
                 transition,
                 trigger_data,
@@ -718,6 +757,7 @@ class BaseEngine:
             if target.final:
                 self._handle_final_state(target, on_entry_result)
 
+        self.sm._state_data.commit_transient_frames()
         return result
 
     def compute_entry_set(

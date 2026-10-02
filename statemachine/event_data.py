@@ -91,4 +91,9 @@ class EventData:
         kwargs["state"] = self.state
         kwargs["source"] = self.source
         kwargs["target"] = self.target
+        kwargs["state_data"] = self.trigger_data.machine._state_data.context_for(self.state)
+        kwargs["local_data"] = kwargs["state_data"]
+        kwargs["target_state_data"] = self.trigger_data.machine._state_data.context_for(
+            self.target
+        )
         return kwargs

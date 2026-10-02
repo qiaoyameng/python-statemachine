@@ -52,6 +52,9 @@ class SyncEngine(BaseEngine):
             self._processing.acquire(blocking=False)
             try:
                 self._enter_states(transitions, trigger_data, OrderedSet(), OrderedSet())
+            except Exception:
+                self.sm._state_data.discard_transient_frames()
+                raise
             finally:
                 self._processing.release()
         return self.processing_loop()

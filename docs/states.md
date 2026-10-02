@@ -59,6 +59,37 @@ True
 ```
 
 
+## State local data
+
+State-local data is declared on a `State` with `StateLocalData`. Every declared
+value must be provided as a zero-argument factory. The factory is invoked when
+the state is entered and the resulting frame is released on exit.
+
+```py
+from statemachine import State, StateLocalData, StateMachine
+
+
+def fresh_items():
+    return []
+
+
+class ApprovalMachine(StateMachine):
+    review = State(initial=True, local_data=StateLocalData(items=fresh_items))
+    done = State(final=True)
+    finish = review.to(done)
+
+    def on_finish(self, state_data):
+        print(state_data["items"])
+```
+
+Callbacks can request the active frame by adding a `state_data` parameter.
+Reads follow the active state chain toward ancestors, child keys shadow parent
+keys, and writes are always applied to the current state's own frame. A frame
+reference retained after exit rejects writes.
+
+Internal self-transitions reuse the current frame; external self-transitions
+and history re-entry create a new frame.
+
 ## Initial state
 
 A {ref}`StateChart` must have exactly one `initial` state. The initial state is

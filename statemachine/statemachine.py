@@ -29,6 +29,7 @@ from .factory import StateMachineMetaclass
 from .graph import iterate_states_and_transitions
 from .i18n import _
 from .model import Model
+from .state_data import StateDataManager
 from .signature import SignatureAdapter
 from .state import InstanceState
 from .utils import run_async_from_sync
@@ -160,6 +161,7 @@ class StateChart(Generic[TModel], metaclass=StateMachineMetaclass):
         )
         self._callbacks = CallbacksRegistry()
         self._config = self._build_configuration()
+        self._state_data = StateDataManager(self)
         self._listeners: dict[int, Any] = {}
         """Listeners that provides attributes to be used as callbacks."""
 
@@ -177,7 +179,7 @@ class StateChart(Generic[TModel], metaclass=StateMachineMetaclass):
         self._engine.start(**kwargs)
 
     def _get_engine(self):
-        if self._callbacks.has_async_callbacks:
+        if self._callbacks.has_async_callbacks or self._state_data.has_async_declarations():
             return AsyncEngine(self)
 
         return SyncEngine(self)
@@ -262,6 +264,7 @@ class StateChart(Generic[TModel], metaclass=StateMachineMetaclass):
         self.__dict__.update(state)  # type: ignore[attr-defined]
         self._callbacks = CallbacksRegistry()
         self._config = self._build_configuration()
+        self._state_data = StateDataManager(self)
         self._listeners = {}
 
         # _listeners already contained both class-level and runtime listeners
@@ -419,6 +422,11 @@ class StateChart(Generic[TModel], metaclass=StateMachineMetaclass):
             stacklevel=2,
         )
         self.current_state_value = value.value
+
+    def state_data(self, state: "State | str | None" = None):
+        """Return the local-data context for an active state or its nearest ancestor."""
+        target = state if state is not None else self.current_state
+        return self._state_data.context_for(target)
 
     @property
     def events(self) -> "list[Event]":

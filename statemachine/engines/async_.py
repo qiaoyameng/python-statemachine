@@ -172,6 +172,29 @@ class AsyncEngine(BaseEngine):
 
         return result
 
+    def _state_data_release(self, state: State) -> None:
+        self.sm._state_data.release(state)
+
+    async def _state_data_build_async(self, state: State, transition: "Transition | None" = None):
+        canonical = self.sm._state_data.resolve_state(state)
+        existing = self.sm._state_data.frames.get(canonical)
+        if existing is None:
+            return await self.sm._state_data.build_async(canonical, replace=True)
+        released = not existing.active
+        if existing is not None and not released:
+            return existing
+        reentered = (
+            transition is not None
+            and not transition.internal
+            and released
+            and self._active_state_for_transition(transition).id == canonical.id
+            and canonical in self._transition_targets_state_data(transition)
+        )
+        if reentered:
+            existing.close()
+            return await self.sm._state_data.build_async(canonical, replace=True)
+        return existing
+
     async def _exit_states(  # type: ignore[override]
         self, enabled_transitions: "list[Transition]", trigger_data: TriggerData
     ) -> "OrderedSet[State]":
@@ -193,6 +216,8 @@ class AsyncEngine(BaseEngine):
                     info.state.exit.key, *args, on_error=on_error, **kwargs
                 )
 
+            canonical = self.sm._state_data.resolve_state(info.state)
+            self._state_data_release(canonical)
             self._remove_state_from_configuration(info.state)
 
         return result
@@ -205,6 +230,7 @@ class AsyncEngine(BaseEngine):
         previous_configuration: "OrderedSet[State]",
     ):
         on_error = self._on_error_handler()
+        self.sm._state_data.begin_transient_frames()
         ordered_states, states_for_default_entry, default_history_content, new_configuration = (
             self._prepare_entry_states(enabled_transitions, states_to_exit, previous_configuration)
         )
@@ -234,9 +260,14 @@ class AsyncEngine(BaseEngine):
         if self.sm.atomic_configuration_update:
             self.sm.configuration = new_configuration
 
+        built_targets: set[str] = set()
         for info in ordered_states:
             target = info.state
             transition = info.transition
+            canonical_target = self.sm._state_data.resolve_state(target)
+            if canonical_target.id not in built_targets:
+                await self._state_data_build_async(target, transition)
+                built_targets.add(canonical_target.id)
             args, kwargs = await self._get_args_kwargs(
                 transition,
                 trigger_data,
@@ -279,6 +310,7 @@ class AsyncEngine(BaseEngine):
             if target.final:
                 self._handle_final_state(target, on_entry_result)
 
+        self.sm._state_data.commit_transient_frames()
         return result
 
     async def microstep(self, transitions: "list[Transition]", trigger_data: TriggerData):
@@ -301,9 +333,11 @@ class AsyncEngine(BaseEngine):
                 transitions, trigger_data, states_to_exit, previous_configuration
             )
         except InvalidDefinition:
+            self.sm._state_data.discard_transient_frames()
             self.sm.configuration = previous_configuration
             raise
         except Exception as e:
+            self.sm._state_data.discard_transient_frames()
             self.sm.configuration = previous_configuration
             self._handle_error(e, trigger_data)
             return None
@@ -352,7 +386,9 @@ class AsyncEngine(BaseEngine):
         Any ``**kwargs`` are forwarded to initial state entry callbacks via dependency
         injection, just like event kwargs on ``send()``.
         """
-        return await self.processing_loop()
+        result = await self.processing_loop()
+        self.external_queue.clear()
+        return result
 
     async def processing_loop(  # noqa: C901
         self, caller_future: "asyncio.Future[object] | None" = None
@@ -447,11 +483,12 @@ class AsyncEngine(BaseEngine):
                     # Break out of phase 3 so the outer loop restarts from phase 1
                     # (eventless/internal), ensuring internal events queued during
                     # initial entry are processed before any external events.
-                    if external_event.event == "__initial__":
+                    if str(external_event.event) == "__initial__":
                         transitions = self._initial_transitions(external_event)
-                        await self._enter_states(
-                            transitions, external_event, OrderedSet(), OrderedSet()
-                        )
+                        if not self.sm.configuration:
+                            await self._enter_states(
+                                transitions, external_event, OrderedSet(), OrderedSet()
+                            )
                         break
 
                     # Finalize + autoforward for active invocations
