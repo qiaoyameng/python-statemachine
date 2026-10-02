@@ -14,6 +14,7 @@ from .callbacks import CallbackSpecList
 from .callbacks import CallbacksRegistry
 from .callbacks import SpecListGrouper
 from .callbacks import SpecReference
+from .decision_trace import DecisionTrace
 from .configuration import Configuration
 from .dispatcher import Listener
 from .dispatcher import Listeners
@@ -55,6 +56,9 @@ class StateChart(Generic[TModel], metaclass=StateMachineMetaclass):
 
         listeners: An optional list of objects that provides attributes to be used as callbacks.
             See :ref:`listeners` for more details.
+
+        enable_decision_trace: Record structural macrostep decision traces without event
+            arguments, keyword arguments, model objects, or exception messages.
 
         **kwargs: Additional keyword arguments available for dependency injection into
             callbacks. These are passed to class listener ``setup()`` methods and to the
@@ -144,6 +148,8 @@ class StateChart(Generic[TModel], metaclass=StateMachineMetaclass):
         state_field: str = "state",
         start_value: Any = None,
         listeners: "list[object] | None" = None,
+        *,
+        enable_decision_trace: bool = False,
         **kwargs: Any,
     ):
         self.model: TModel = model if model is not None else Model()  # type: ignore[assignment]
@@ -161,7 +167,8 @@ class StateChart(Generic[TModel], metaclass=StateMachineMetaclass):
         self._callbacks = CallbacksRegistry()
         self._config = self._build_configuration()
         self._listeners: dict[int, Any] = {}
-        """Listeners that provides attributes to be used as callbacks."""
+        self._decision_trace = DecisionTrace(enabled=enable_decision_trace)
+        """Structural decision trace for the machine."""
 
         if self._abstract:
             raise InvalidDefinition(_("There are no states or transitions."))
@@ -176,11 +183,16 @@ class StateChart(Generic[TModel], metaclass=StateMachineMetaclass):
         self._engine = self._get_engine()
         self._engine.start(**kwargs)
 
+    @property
+    def decision_trace(self) -> DecisionTrace:
+        """Structural decision trace for external event macrosteps."""
+        return self._decision_trace
+
     def _get_engine(self):
         if self._callbacks.has_async_callbacks:
-            return AsyncEngine(self)
+            return AsyncEngine(self, self._decision_trace)
 
-        return SyncEngine(self)
+        return SyncEngine(self, self._decision_trace)
 
     def _resolve_class_listeners(self, **kwargs: Any) -> list[object]:
         resolved: list[object] = []

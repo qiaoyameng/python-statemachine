@@ -15,6 +15,8 @@ from .base import _ERROR_EXECUTION
 from .base import BaseEngine
 
 if TYPE_CHECKING:
+    from ..decision_trace import CandidateDecision
+    from ..decision_trace import GuardDecision
     from ..transition import Transition
 
 # ContextVar to distinguish reentrant calls (from within callbacks) from
@@ -102,47 +104,87 @@ class AsyncEngine(BaseEngine):
         self._cache[cache_key] = (args, kwargs)
         return args, kwargs
 
-    async def _conditions_match(self, transition: "Transition", trigger_data: TriggerData):
-        args, kwargs = await self._get_args_kwargs(transition, trigger_data)
-        on_error = self._on_error_handler()
-
-        await self.sm._callbacks.async_call(
-            transition.validators.key, *args, on_error=None, **kwargs
-        )
-        return await self.sm._callbacks.async_all(
-            transition.cond.key, *args, on_error=on_error, **kwargs
-        )
-
     async def _first_transition_that_matches(  # type: ignore[override]
         self,
         state: State,
         trigger_data: TriggerData,
         predicate: Callable,
     ) -> "Transition | None":
-        for s in chain([state], state.ancestors()):
-            transition: "Transition"
-            for transition in s.transitions:
-                if (
-                    not transition.initial
-                    and predicate(transition, trigger_data.event)
-                    and await self._conditions_match(transition, trigger_data)
-                ):
-                    return transition
+        trace = self.decision_trace
+        candidates = []
+
+        for transition in self._matching_transitions(state, trigger_data, predicate):
+            guard_decisions = self._guard_decisions(transition) if trace.enabled else []
+            candidate = trace.add_candidate(transition, state, guard_decisions)
+            candidates.append((transition, candidate, guard_decisions))
+
+            args, kwargs = await self._get_args_kwargs(transition, trigger_data)
+            await self.sm._callbacks.async_call(
+                transition.validators.key, *args, on_error=None, **kwargs
+            )
+            if not await self._async_guards_match(
+                transition, candidate, guard_decisions, args, kwargs
+            ):
+                continue
+            trace.mark_candidate_enabled(candidate)
+            self._trace_shadowed_alternatives(
+                state, trigger_data, predicate, transition, candidate, candidates
+            )
+            return transition
         return None
+
+    async def _async_guards_match(
+        self,
+        transition: "Transition",
+        candidate: "CandidateDecision | None",
+        guard_decisions: "list[GuardDecision]",
+        args: tuple,
+        kwargs: dict,
+    ) -> bool:
+        trace = self.decision_trace
+        on_error = self._on_error_handler()
+        guards = list(self.sm._callbacks[transition.cond.key])
+
+        for index, guard in enumerate(guards):
+            guard_decision = guard_decisions[index] if index < len(guard_decisions) else None
+            try:
+                result = bool(await guard(*args, **kwargs))
+            except Exception as error:
+                if on_error is not None and not isinstance(error, InvalidDefinition):
+                    on_error(error)
+                    trace.mark_guard_error(candidate, guard_decision, error)
+                    return False
+                trace.mark_guard_error(candidate, guard_decision, error)
+                raise
+            trace.mark_guard_result(candidate, guard_decision, result)
+            if not result:
+                return False
+        return True
 
     async def _select_transitions(  # type: ignore[override]
         self, trigger_data: TriggerData, predicate: Callable
     ) -> "OrderedSet[Transition]":
+        trace = self.decision_trace
+        trace.begin_selection(trigger_data, getattr(trigger_data, "origin", "external"))
         enabled_transitions: "OrderedSet[Transition]" = OrderedSet()
 
         atomic_states = (state for state in self.sm.configuration if state.is_atomic)
 
-        for state in atomic_states:
-            transition = await self._first_transition_that_matches(state, trigger_data, predicate)
-            if transition is not None:
-                enabled_transitions.add(transition)
+        try:
+            for state in atomic_states:
+                transition = await self._first_transition_that_matches(
+                    state, trigger_data, predicate
+                )
+                if transition is not None:
+                    enabled_transitions.add(transition)
 
-        return self._filter_conflicting_transitions(enabled_transitions)
+            filtered = self._filter_conflicting_transitions(enabled_transitions)
+        except Exception as error:
+            trace.finish_selection(enabled_transitions)
+            trace.mark_external_error(error)
+            raise
+        trace.finish_selection(filtered)
+        return filtered
 
     async def select_eventless_transitions(self, trigger_data: TriggerData):
         return await self._select_transitions(trigger_data, lambda t, _e: t.is_eventless)
@@ -291,6 +333,7 @@ class AsyncEngine(BaseEngine):
             transitions,
         )
         previous_configuration = self.sm.configuration
+        self.decision_trace.mark_microstep(trigger_data, transitions)
         try:
             result = await self._execute_transition_content(
                 transitions, trigger_data, lambda t: t.before.key
@@ -300,11 +343,15 @@ class AsyncEngine(BaseEngine):
             result += await self._enter_states(
                 transitions, trigger_data, states_to_exit, previous_configuration
             )
-        except InvalidDefinition:
+        except InvalidDefinition as error:
             self.sm.configuration = previous_configuration
+            self.decision_trace.mark_execution_error(error, fatal=True)
             raise
         except Exception as e:
             self.sm.configuration = previous_configuration
+            self.decision_trace.mark_execution_error(
+                e, fatal=not self.sm.catch_errors_as_events
+            )
             self._handle_error(e, trigger_data)
             return None
 
@@ -394,7 +441,9 @@ class AsyncEngine(BaseEngine):
                     )
 
                     self.clear_cache()
-                    internal_event = TriggerData(self.sm, event=None)  # null object for eventless
+                    internal_event = TriggerData(
+                        self.sm, event=None, origin="eventless"
+                    )  # null object for eventless
                     enabled_transitions = await self.select_eventless_transitions(internal_event)
                     if not enabled_transitions:
                         if self.internal_queue.is_empty():
@@ -423,6 +472,7 @@ class AsyncEngine(BaseEngine):
                 # Phase 3: external events
                 self._debug("%s Macrostep %d: external queue", self._log_id, self._macrostep_count)
                 while not self.external_queue.is_empty():
+                    self.decision_trace.complete_macrostep()
                     self.clear_cache()
                     took_events = True
                     external_event = self.external_queue.pop()
@@ -436,6 +486,7 @@ class AsyncEngine(BaseEngine):
 
                     self._macrostep_count += 1
                     self._microstep_count = 0
+                    self.decision_trace.begin_macrostep(external_event)
                     self._debug(
                         "%s macrostep %d: event=%s",
                         self._log_id,
@@ -481,6 +532,7 @@ class AsyncEngine(BaseEngine):
                             # Event allowed but no transition — resolve with None
                             self._resolve_future(event_future, None)
                     except Exception as exc:
+                        self.decision_trace.mark_external_error(exc)
                         self._reject_future(event_future, exc)
                         self._reject_pending_futures(exc)
                         self.clear()
@@ -498,6 +550,7 @@ class AsyncEngine(BaseEngine):
             else:
                 raise
         finally:
+            self.decision_trace.complete_macrostep()
             _in_processing_loop.reset(_ctx_token)
             self._processing.release()
 

@@ -1,3 +1,9 @@
+from .decision_trace import CandidateDecision
+from .decision_trace import DecisionTrace
+from .decision_trace import GuardDecision
+from .decision_trace import MacrostepDecision
+from .decision_trace import MicrostepDecision
+from .decision_trace import TransitionDefinition
 from .event import Event
 from .state import HistoryState
 from .state import HistoryType
@@ -17,5 +23,11 @@ __all__ = [
     "HistoryState",
     "HistoryType",
     "Event",
+    "DecisionTrace",
+    "TransitionDefinition",
+    "MacrostepDecision",
+    "MicrostepDecision",
+    "CandidateDecision",
+    "GuardDecision",
     "TModel",
 ]

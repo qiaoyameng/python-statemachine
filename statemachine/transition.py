@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING
 from .callbacks import CallbackGroup
 from .callbacks import CallbackPriority
 from .callbacks import CallbackSpecList
+from .decision_trace import TransitionDefinition
+from .decision_trace import capture_transition_definition
 from .events import Events
 from .exceptions import InvalidDefinition
 from .i18n import _
@@ -52,8 +54,14 @@ class Transition:
         on=None,
         before=None,
         after=None,
+        definition_location: TransitionDefinition | None = None,
     ):
         self.source = source
+        self.definition_location = (
+            definition_location
+            if definition_location is not None
+            else capture_transition_definition()
+        )
         if isinstance(target, list):
             self._targets: "list[State]" = target
         elif target is not None:
@@ -171,7 +179,12 @@ class Transition:
         event = kwargs.pop("event", self.event)
         internal = kwargs.pop("internal", self.internal)
         new_transition = Transition(
-            source=source, target=target, event=event, internal=internal, **kwargs
+            source=source,
+            target=target,
+            event=event,
+            internal=internal,
+            definition_location=self.definition_location,
+            **kwargs,
         )
         for spec in self._specs:
             new_spec = deepcopy(spec)

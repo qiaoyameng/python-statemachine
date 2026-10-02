@@ -37,6 +37,7 @@ class TriggerData:
     """All keyword arguments provided on the :ref:`Event`."""
 
     future: Any = field(default=None, compare=False, repr=False, init=False)
+    origin: str = field(default="external", compare=False)
     """An optional :class:`asyncio.Future` for async result routing.
 
     When set, the processing loop will resolve this future with the microstep
@@ -47,6 +48,8 @@ class TriggerData:
         self.model = self.machine.model
         delay = self.event.delay if self.event and self.event.delay else 0
         self.execution_time = time() + (delay / 1000)
+        if self.origin == "external" and self.event is not None and self.event.internal:
+            self.origin = "internal"
 
 
 @dataclass

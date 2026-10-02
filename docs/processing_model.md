@@ -74,6 +74,48 @@ After the macrostep completes, the engine picks the next event from the
 **external queue** (placed by `send()`) and starts a new macrostep.
 
 
+
+### Decision tracing
+
+Enable ``enable_decision_trace`` to capture the real decisions made by one external event's
+macrostep. The trace records definition location, active/source states, guard results, exit-set
+conflicts, and causal microstep order. Guards that the engine did not run remain ``not_evaluated``;
+they are never represented as ``false``.
+
+```py
+>>> from statemachine import State, StateChart
+
+>>> class ApprovalTrace(StateChart):
+...     draft = State(initial=True)
+...     accepted = State()
+...     rejected = State()
+...     done = State(final=True)
+...
+...     decide = draft.to(accepted, cond="trace_accepts") | draft.to(rejected, cond="trace_rejects")
+...     finish = accepted.to(done) | rejected.to(done)
+...
+...     def trace_accepts(self):
+...         return True
+...
+...     def trace_rejects(self):
+...         return False
+
+>>> sm = ApprovalTrace(enable_decision_trace=True)
+>>> result = sm.send("decide")
+>>> sm.send("finish")
+>>> decision = sm.decision_trace.to_dict()["macrosteps"][0]
+>>> [step["trigger_origin"] for step in decision["steps"]]
+['external']
+>>> [(candidate["source_state"], candidate["guards"][0]["status"], candidate["eliminated_by_rule"])
+...  for candidate in decision["steps"][0]["candidates"]]
+[('draft', 'true', None), ('draft', 'not_evaluated', 'transition_order_priority')]
+
+```
+
+The snapshot deliberately omits event arguments, keyword arguments, the model object, and
+exception messages. Only exception type names and state/event identifiers are stored, so turning
+on tracing does not capture business data or sensitive parameters.
+
 ### Event queues
 
 The engine maintains two separate FIFO queues:

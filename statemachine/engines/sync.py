@@ -97,7 +97,7 @@ class SyncEngine(BaseEngine):
 
                     self.clear_cache()
                     internal_event = TriggerData(
-                        self.sm, event=None
+                        self.sm, event=None, origin="eventless"
                     )  # this one is a "null object"
                     enabled_transitions = self.select_eventless_transitions(internal_event)
                     if not enabled_transitions:
@@ -129,6 +129,7 @@ class SyncEngine(BaseEngine):
                 # Process external events
                 self._debug("%s Macrostep %d: external queue", self._log_id, self._macrostep_count)
                 while not self.external_queue.is_empty():
+                    self.decision_trace.complete_macrostep()
                     self.clear_cache()
                     took_events = True
                     external_event = self.external_queue.pop()
@@ -142,6 +143,7 @@ class SyncEngine(BaseEngine):
 
                     self._macrostep_count += 1
                     self._microstep_count = 0
+                    self.decision_trace.begin_macrostep(external_event)
                     self._debug(
                         "%s macrostep %d: event=%s",
                         self._log_id,
@@ -160,17 +162,23 @@ class SyncEngine(BaseEngine):
                             if first_result is self._sentinel:
                                 first_result = result
 
-                        except Exception:
+                        except Exception as error:
                             # We clear the queue as we don't have an expected behavior
                             # and cannot keep processing
+                            self.decision_trace.mark_external_error(error)
                             self.clear()
                             raise
 
                     else:
                         if not self.sm.allow_event_without_transition:
-                            raise TransitionNotAllowed(external_event.event, self.sm.configuration)
+                            not_allowed = TransitionNotAllowed(
+                                external_event.event, self.sm.configuration
+                            )
+                            self.decision_trace.mark_external_error(not_allowed)
+                            raise not_allowed
 
         finally:
+            self.decision_trace.complete_macrostep()
             self._processing.release()
         self._debug("%s Processing loop ended", self._log_id)
         return first_result if first_result is not self._sentinel else None

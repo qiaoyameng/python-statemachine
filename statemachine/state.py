@@ -8,6 +8,7 @@ from weakref import ref
 from .callbacks import CallbackGroup
 from .callbacks import CallbackPriority
 from .callbacks import CallbackSpecList
+from .decision_trace import capture_transition_definition
 from .event import Event
 from .event import _expand_event_id
 from .exceptions import InvalidDefinition
@@ -35,7 +36,13 @@ class _TransitionBuilder:
 class _ToState(_TransitionBuilder):
     def __call__(self, *states: "State | NestedStateFactory | None", **kwargs):
         transitions = TransitionList(
-            Transition(self._state, cast("State | None", state), **kwargs) for state in states
+            Transition(
+                self._state,
+                cast("State | None", state),
+                definition_location=capture_transition_definition(index=index),
+                **kwargs,
+            )
+            for index, state in enumerate(states)
         )
         self._state.transitions.add_transitions(transitions)
         return transitions

@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Callable
+from collections.abc import Iterable
 from dataclasses import dataclass
 from dataclasses import field
 from itertools import chain
@@ -10,6 +11,9 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
+from ..decision_trace import CandidateDecision
+from ..decision_trace import DecisionTrace
+from ..decision_trace import GuardDecision
 from ..event import BoundEvent
 from ..event_data import EventData
 from ..event_data import TriggerData
@@ -82,7 +86,7 @@ _ERROR_EXECUTION = "error.execution"
 
 
 class BaseEngine:
-    def __init__(self, sm: "StateChart"):
+    def __init__(self, sm: "StateChart", decision_trace: DecisionTrace | None = None):
         self.sm: "StateChart" = sm
         self.external_queue = EventQueue()
         self.internal_queue = EventQueue()
@@ -96,6 +100,11 @@ class BaseEngine:
         self._log_id = f"[{type(sm).__name__}]"
         self._debug = logger.debug if logger.isEnabledFor(logging.DEBUG) else lambda *a, **k: None
         self._root_parallel_final_pending: "State | None" = None
+        self.decision_trace = (
+            decision_trace
+            if decision_trace is not None
+            else DecisionTrace(enabled=False)
+        )
 
     def empty(self):  # pragma: no cover
         return self.external_queue.is_empty()
@@ -198,7 +207,8 @@ class BaseEngine:
         return transitions
 
     def _filter_conflicting_transitions(
-        self, transitions: OrderedSet[Transition]
+        self,
+        transitions: OrderedSet[Transition],
     ) -> OrderedSet[Transition]:
         """
         Remove transições conflitantes, priorizando aquelas com estados de origem descendentes
@@ -226,10 +236,24 @@ class BaseEngine:
                 # Verifica interseção dos conjuntos de saída
                 if t1_exit_set & t2_exit_set:  # Há interseção
                     if t1.source.is_descendant(t2.source):
-                        # t1 é preferido pois é descendente de t2
+                        # t1 is preferred because it is a descendant of t2.
+                        self.decision_trace.mark_exit_conflict(
+                            t2,
+                            t1,
+                            t1_exit_set & t2_exit_set,
+                            descendant_priority=True,
+                            conflicting_domains=self._conflict_domains(t1, t2),
+                        )
                         transitions_to_remove.add(t2)
                     else:
-                        # t2 é preferido pois foi selecionado antes na ordem do documento
+                        # t2 is preferred by source/exit-set priority.
+                        self.decision_trace.mark_exit_conflict(
+                            t1,
+                            t2,
+                            t1_exit_set & t2_exit_set,
+                            descendant_priority=False,
+                            conflicting_domains=self._conflict_domains(t1, t2),
+                        )
                         t1_preempted = True
                         break
 
@@ -240,6 +264,14 @@ class BaseEngine:
                 filtered_transitions.add(t1)
 
         return filtered_transitions
+
+    def _conflict_domains(self, first: Transition, second: Transition) -> tuple[str, ...]:
+        domains: list[str] = []
+        for transition in (first, second):
+            for state in (transition.source, self.get_transition_domain(transition)):
+                if state is not None and state.id not in domains:
+                    domains.append(state.id)
+        return tuple(domains)
 
     def _compute_exit_set(self, transitions: list[Transition]) -> OrderedSet[StateTransition]:
         """Compute the exit set for a transition."""
@@ -342,32 +374,124 @@ class BaseEngine:
         trigger_data: TriggerData,
         predicate: Callable,
     ) -> "Transition | None":
-        for s in chain([state], state.ancestors()):
-            transition: Transition
-            for transition in s.transitions:
-                if (
-                    not transition.initial
-                    and predicate(transition, trigger_data.event)
-                    and self._conditions_match(transition, trigger_data)
-                ):
-                    return transition
+        trace = self.decision_trace
+        candidates = []
+
+        for transition in self._matching_transitions(state, trigger_data, predicate):
+            guard_decisions = self._guard_decisions(transition) if trace.enabled else []
+            candidate = trace.add_candidate(transition, state, guard_decisions)
+            candidates.append((transition, candidate, guard_decisions))
+
+            args, kwargs = self._get_args_kwargs(transition, trigger_data)
+            self.sm._callbacks.call(transition.validators.key, *args, on_error=None, **kwargs)
+            if not self._guards_match(
+                transition, trigger_data, candidate, guard_decisions, args, kwargs
+            ):
+                continue
+            trace.mark_candidate_enabled(candidate)
+            self._trace_shadowed_alternatives(
+                state, trigger_data, predicate, transition, candidate, candidates
+            )
+            return transition
         return None
+
+    def _matching_transitions(
+        self,
+        state: State,
+        trigger_data: TriggerData,
+        predicate: Callable,
+    ) -> Iterable[Transition]:
+        for ancestor in chain([state], state.ancestors()):
+            for transition in ancestor.transitions:
+                if not transition.initial and predicate(transition, trigger_data.event):
+                    yield transition
+
+    def _trace_shadowed_alternatives(
+        self,
+        state: State,
+        trigger_data: TriggerData,
+        predicate: Callable,
+        winner_transition: Transition,
+        winner_candidate: CandidateDecision | None,
+        discovered_candidates: list[tuple[Transition, object, list[GuardDecision]]],
+    ) -> None:
+        trace = self.decision_trace
+        if not trace.enabled or winner_candidate is None:
+            return
+
+        seen = {id(item[0]) for item in discovered_candidates}
+        for transition in self._matching_transitions(state, trigger_data, predicate):
+            if id(transition) in seen:
+                continue
+            if winner_transition.source.is_descendant(transition.source):
+                rule = "descendant_source_priority"
+            elif transition.source == winner_transition.source:
+                rule = "transition_order_priority"
+            else:
+                rule = "ancestor_source_priority"
+            guard_decisions = self._guard_decisions(transition)
+            candidate = trace.add_candidate(transition, state, guard_decisions)
+            trace.shadow_candidate(candidate, winner_candidate, rule)
+
+    def _guard_decisions(self, transition: Transition) -> list[GuardDecision]:
+        return [
+            GuardDecision(name=str(callback.meta))
+            for callback in self.sm._callbacks[transition.cond.key]
+        ]
+
+    def _guards_match(
+        self,
+        transition: Transition,
+        trigger_data: TriggerData,
+        candidate: CandidateDecision | None,
+        guard_decisions: list[GuardDecision],
+        args: tuple,
+        kwargs: dict,
+    ) -> bool:
+        trace = self.decision_trace
+        on_error = self._on_error_handler()
+        guards = list(self.sm._callbacks[transition.cond.key])
+
+        for index, guard in enumerate(guards):
+            guard_decision = guard_decisions[index] if index < len(guard_decisions) else None
+            try:
+                result = bool(guard.call(*args, **kwargs))
+            except Exception as error:
+                if on_error is not None and not isinstance(error, InvalidDefinition):
+                    on_error(error)
+                    trace.mark_guard_error(candidate, guard_decision, error)
+                    return False
+                trace.mark_guard_error(candidate, guard_decision, error)
+                raise
+            trace.mark_guard_result(candidate, guard_decision, result)
+            if not result:
+                return False
+        return True
 
     def _select_transitions(
         self, trigger_data: TriggerData, predicate: Callable
     ) -> OrderedSet[Transition]:
         """Select the transitions that match the trigger data."""
+        trace = self.decision_trace
+        trace.begin_selection(trigger_data, getattr(trigger_data, "origin", "external"))
         enabled_transitions = OrderedSet[Transition]()
 
         # Get atomic states, TODO: sorted by document order
         atomic_states = (state for state in self.sm.configuration if state.is_atomic)
 
-        for state in atomic_states:
-            transition = self._first_transition_that_matches(state, trigger_data, predicate)
-            if transition is not None:
-                enabled_transitions.add(transition)
+        try:
+            for state in atomic_states:
+                transition = self._first_transition_that_matches(state, trigger_data, predicate)
+                if transition is not None:
+                    enabled_transitions.add(transition)
 
-        return self._filter_conflicting_transitions(enabled_transitions)
+            filtered = self._filter_conflicting_transitions(enabled_transitions)
+        except Exception as error:
+            trace.finish_selection(enabled_transitions)
+            trace.mark_external_error(error)
+            raise
+        trace.finish_selection(filtered)
+        return filtered
 
     def microstep(self, transitions: list[Transition], trigger_data: TriggerData):
         """Process a single set of transitions in a 'lock step'.
@@ -382,6 +506,7 @@ class BaseEngine:
             transitions,
         )
         previous_configuration = self.sm.configuration
+        self.decision_trace.mark_microstep(trigger_data, transitions)
         try:
             result = self._execute_transition_content(
                 transitions, trigger_data, lambda t: t.before.key
@@ -391,11 +516,15 @@ class BaseEngine:
             result += self._enter_states(
                 transitions, trigger_data, states_to_exit, previous_configuration
             )
-        except InvalidDefinition:
+        except InvalidDefinition as error:
             self.sm.configuration = previous_configuration
+            self.decision_trace.mark_execution_error(error, fatal=True)
             raise
         except Exception as e:
             self.sm.configuration = previous_configuration
+            self.decision_trace.mark_execution_error(
+                e, fatal=not self.sm.catch_errors_as_events
+            )
             self._handle_error(e, trigger_data)
             return None
 
