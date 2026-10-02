@@ -35,6 +35,7 @@ processing_model
 error_handling
 async
 listeners
+persistence
 ```
 
 ```{toctree}

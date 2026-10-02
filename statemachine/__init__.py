@@ -1,4 +1,11 @@
 from .event import Event
+from .exceptions import InvalidSnapshot
+from .exceptions import SnapshotError
+from .exceptions import SnapshotNotQuiescentError
+from .persistence import Snapshot
+from .persistence import definition_fingerprint
+from .persistence import restore_snapshot
+from .persistence import take_snapshot
 from .state import HistoryState
 from .state import HistoryType
 from .state import State
@@ -18,4 +25,11 @@ __all__ = [
     "HistoryType",
     "Event",
     "TModel",
+    "Snapshot",
+    "SnapshotError",
+    "SnapshotNotQuiescentError",
+    "InvalidSnapshot",
+    "take_snapshot",
+    "restore_snapshot",
+    "definition_fingerprint",
 ]

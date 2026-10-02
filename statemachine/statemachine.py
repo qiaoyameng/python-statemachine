@@ -35,6 +35,7 @@ from .utils import run_async_from_sync
 
 if TYPE_CHECKING:
     from .event import Event
+    from .persistence import Snapshot
     from .state import State
     from .states import States
 
@@ -509,6 +510,47 @@ class StateChart(Generic[TModel], metaclass=StateMachineMetaclass):
     def cancel_event(self, send_id: str):
         """Cancel all the delayed events with the given ``send_id``."""
         self._engine.cancel_event(send_id)
+
+    def take_snapshot(
+        self, include_model_data: "list[str] | tuple[str, ...] | None" = None
+    ) -> "Snapshot":
+        """Export an explicit, quiescent checkpoint of this machine.
+
+        Only stable configurations can be checkpointed: the machine must be
+        activated, idle (no transition in progress), with empty event queues and
+        no active/pending invocation.  Otherwise a
+        :class:`~statemachine.exceptions.SnapshotNotQuiescentError` is raised
+        explaining why.
+
+        Args:
+            include_model_data: Optional whitelist of model attribute names to
+                persist.  Values must be JSON-native; functions, locks, futures
+                and arbitrary objects are never serialized.
+        """
+        from .persistence import take_snapshot
+
+        return take_snapshot(self, include_model_data=include_model_data)
+
+    @classmethod
+    def restore_snapshot(
+        cls,
+        snapshot: "Snapshot | dict | str | bytes",
+        model: Any = None,
+        *,
+        listeners: "list[object] | None" = None,
+        **kwargs: Any,
+    ) -> "StateChart":
+        """Create a new machine instance from a snapshot without replaying actions.
+
+        The snapshot is validated against the current class (version, definition
+        fingerprint, state ids, parallel completeness, parent/child and history
+        constraints) *before* any user callback can run.  Entry/exit handlers and
+        already-completed transition actions are not executed, and missing
+        states are never guessed from initial transitions.
+        """
+        from .persistence import restore_snapshot
+
+        return restore_snapshot(cls, snapshot, model, listeners=listeners, **kwargs)
 
     @property
     def is_terminated(self):

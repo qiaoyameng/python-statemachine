@@ -30,6 +30,27 @@ class AttrNotFound(InvalidDefinition):
     "There's no method or property with the given name"
 
 
+class SnapshotError(StateMachineError):
+    "Base class for errors while exporting or restoring a :ref:`persistence` snapshot."
+
+
+class SnapshotNotQuiescentError(SnapshotError):
+    """A snapshot was requested while the state machine cannot be checkpointed.
+
+    The machine is quiescent only when it is activated, no event is being
+    processed, the external/internal event queues are empty, and there is no
+    pending or active invocation.
+    """
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+class InvalidSnapshot(SnapshotError):
+    "The snapshot payload is malformed or incompatible with the current definition."
+
+
 class TransitionNotAllowed(StateMachineError):
     "Raised when there's no transition that can run from the current :ref:`configuration`."
 
