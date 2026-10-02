@@ -31,6 +31,7 @@ from .i18n import _
 from .model import Model
 from .signature import SignatureAdapter
 from .state import InstanceState
+from .trace import DecisionTracer
 from .utils import run_async_from_sync
 
 if TYPE_CHECKING:
@@ -181,6 +182,16 @@ class StateChart(Generic[TModel], metaclass=StateMachineMetaclass):
             return AsyncEngine(self)
 
         return SyncEngine(self)
+
+    @property
+    def decision_tracer(self) -> DecisionTracer:
+        """The engine's :class:`DecisionTracer`, recording why transitions were
+        or were not executed within each macrostep.
+
+        Disabled by default. Set ``sm.decision_tracer.enabled = True`` to start
+        recording and inspect ``sm.decision_tracer.macrosteps``.
+        """
+        return self._engine.tracer
 
     def _resolve_class_listeners(self, **kwargs: Any) -> list[object]:
         resolved: list[object] = []

@@ -122,17 +122,20 @@ class AsyncEngine(BaseEngine):
         for s in chain([state], state.ancestors()):
             transition: "Transition"
             for transition in s.transitions:
-                if (
-                    not transition.initial
-                    and predicate(transition, trigger_data.event)
-                    and await self._conditions_match(transition, trigger_data)
-                ):
+                if transition.initial or not predicate(transition, trigger_data.event):
+                    continue
+                matched = await self._conditions_match(transition, trigger_data)
+                self.tracer.record_guard(transition, state, matched)
+                if matched:
+                    self._trace_shadowed(state, trigger_data, predicate, transition)
                     return transition
         return None
 
     async def _select_transitions(  # type: ignore[override]
-        self, trigger_data: TriggerData, predicate: Callable
+        self, trigger_data: TriggerData, predicate: Callable, kind: str
     ) -> "OrderedSet[Transition]":
+        event = trigger_data.event
+        self.tracer.begin_microstep(str(event) if event is not None else None, kind)
         enabled_transitions: "OrderedSet[Transition]" = OrderedSet()
 
         atomic_states = (state for state in self.sm.configuration if state.is_atomic)
@@ -145,10 +148,14 @@ class AsyncEngine(BaseEngine):
         return self._filter_conflicting_transitions(enabled_transitions)
 
     async def select_eventless_transitions(self, trigger_data: TriggerData):
-        return await self._select_transitions(trigger_data, lambda t, _e: t.is_eventless)
+        return await self._select_transitions(
+            trigger_data, lambda t, _e: t.is_eventless, kind="eventless"
+        )
 
-    async def select_transitions(self, trigger_data: TriggerData) -> "OrderedSet[Transition]":  # type: ignore[override]
-        return await self._select_transitions(trigger_data, lambda t, e: t.match(e))
+    async def select_transitions(  # type: ignore[override]
+        self, trigger_data: TriggerData, kind: str = "external"
+    ) -> "OrderedSet[Transition]":
+        return await self._select_transitions(trigger_data, lambda t, e: t.match(e), kind=kind)
 
     async def _execute_transition_content(
         self,
@@ -283,6 +290,7 @@ class AsyncEngine(BaseEngine):
 
     async def microstep(self, transitions: "list[Transition]", trigger_data: TriggerData):
         self._microstep_count += 1
+        self.tracer.record_execution(transitions)
         self._debug(
             "%s macro:%d micro:%d transitions: %s",
             self._log_id,
@@ -401,7 +409,9 @@ class AsyncEngine(BaseEngine):
                             macrostep_done = True
                         else:
                             internal_event = self.internal_queue.pop()
-                            enabled_transitions = await self.select_transitions(internal_event)
+                            enabled_transitions = await self.select_transitions(
+                                internal_event, kind="internal"
+                            )
                     if enabled_transitions:
                         self._debug(
                             "%s Enabled transitions: %s", self._log_id, enabled_transitions
@@ -416,7 +426,9 @@ class AsyncEngine(BaseEngine):
                 # Phase 2: remaining internal events
                 while not self.internal_queue.is_empty():  # pragma: no cover
                     internal_event = self.internal_queue.pop()
-                    enabled_transitions = await self.select_transitions(internal_event)
+                    enabled_transitions = await self.select_transitions(
+                        internal_event, kind="internal"
+                    )
                     if enabled_transitions:
                         await self._run_microstep(enabled_transitions, internal_event)
 
@@ -436,6 +448,7 @@ class AsyncEngine(BaseEngine):
 
                     self._macrostep_count += 1
                     self._microstep_count = 0
+                    self.tracer.begin_macrostep(self._macrostep_count, str(external_event.event))
                     self._debug(
                         "%s macrostep %d: event=%s",
                         self._log_id,

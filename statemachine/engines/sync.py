@@ -105,7 +105,9 @@ class SyncEngine(BaseEngine):
                             macrostep_done = True
                         else:
                             internal_event = self.internal_queue.pop()
-                            enabled_transitions = self.select_transitions(internal_event)
+                            enabled_transitions = self.select_transitions(
+                                internal_event, kind="internal"
+                            )
                     if enabled_transitions:
                         self._debug(
                             "%s Enabled transitions: %s", self._log_id, enabled_transitions
@@ -122,7 +124,7 @@ class SyncEngine(BaseEngine):
                 # so this is a safety net per SCXML spec for invoke-generated events.
                 while not self.internal_queue.is_empty():  # pragma: no cover
                     internal_event = self.internal_queue.pop()
-                    enabled_transitions = self.select_transitions(internal_event)
+                    enabled_transitions = self.select_transitions(internal_event, kind="internal")
                     if enabled_transitions:
                         self._run_microstep(enabled_transitions, internal_event)
 
@@ -142,6 +144,7 @@ class SyncEngine(BaseEngine):
 
                     self._macrostep_count += 1
                     self._microstep_count = 0
+                    self.tracer.begin_macrostep(self._macrostep_count, str(external_event.event))
                     self._debug(
                         "%s macrostep %d: event=%s",
                         self._log_id,

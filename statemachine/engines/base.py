@@ -19,6 +19,7 @@ from ..invoke import InvokeManager
 from ..orderedset import OrderedSet
 from ..state import HistoryState
 from ..state import State
+from ..trace import DecisionTracer
 from ..transition import Transition
 
 if TYPE_CHECKING:
@@ -96,6 +97,9 @@ class BaseEngine:
         self._log_id = f"[{type(sm).__name__}]"
         self._debug = logger.debug if logger.isEnabledFor(logging.DEBUG) else lambda *a, **k: None
         self._root_parallel_final_pending: "State | None" = None
+        self.tracer = DecisionTracer()
+        """Decision tracer recording why transitions were or were not executed.
+        Disabled by default; set ``tracer.enabled = True`` to start recording."""
 
     def empty(self):  # pragma: no cover
         return self.external_queue.is_empty()
@@ -223,14 +227,23 @@ class BaseEngine:
                 t1_exit_set = self._compute_exit_set([t1])
                 t2_exit_set = self._compute_exit_set([t2])
 
+                intersection = t1_exit_set & t2_exit_set
                 # Verifica interseção dos conjuntos de saída
-                if t1_exit_set & t2_exit_set:  # Há interseção
+                if intersection:  # Há interseção
+                    overlap = tuple(sorted(st.state.id for st in intersection))
                     if t1.source.is_descendant(t2.source):
                         # t1 é preferido pois é descendente de t2
                         transitions_to_remove.add(t2)
+                        self.tracer.record_preemption(t2, t1, "descendant_priority", overlap)
                     else:
                         # t2 é preferido pois foi selecionado antes na ordem do documento
                         t1_preempted = True
+                        rule = (
+                            "descendant_priority"
+                            if t2.source.is_descendant(t1.source)
+                            else "document_order"
+                        )
+                        self.tracer.record_preemption(t1, t2, rule, overlap)
                         break
 
             # Se t1 não foi preemptado, adiciona a lista filtrada e remove os conflitantes
@@ -328,13 +341,17 @@ class BaseEngine:
         """
         Select the eventless transitions that match the trigger data.
         """
-        return self._select_transitions(trigger_data, lambda t, _e: t.is_eventless)
+        return self._select_transitions(
+            trigger_data, lambda t, _e: t.is_eventless, kind="eventless"
+        )
 
-    def select_transitions(self, trigger_data: TriggerData) -> OrderedSet[Transition]:
+    def select_transitions(
+        self, trigger_data: TriggerData, kind: str = "external"
+    ) -> OrderedSet[Transition]:
         """
         Select the transitions that match the trigger data.
         """
-        return self._select_transitions(trigger_data, lambda t, e: t.match(e))
+        return self._select_transitions(trigger_data, lambda t, e: t.match(e), kind=kind)
 
     def _first_transition_that_matches(
         self,
@@ -345,18 +362,48 @@ class BaseEngine:
         for s in chain([state], state.ancestors()):
             transition: Transition
             for transition in s.transitions:
-                if (
-                    not transition.initial
-                    and predicate(transition, trigger_data.event)
-                    and self._conditions_match(transition, trigger_data)
-                ):
+                if transition.initial or not predicate(transition, trigger_data.event):
+                    continue
+                matched = self._conditions_match(transition, trigger_data)
+                self.tracer.record_guard(transition, state, matched)
+                if matched:
+                    self._trace_shadowed(state, trigger_data, predicate, transition)
                     return transition
         return None
 
+    def _trace_shadowed(
+        self,
+        state: State,
+        trigger_data: TriggerData,
+        predicate: Callable,
+        winner: Transition,
+    ):
+        """Record candidates never evaluated because ``winner`` matched first.
+
+        Only the pure ``predicate`` (event matching) is checked — guards are
+        never called here, so shadowed candidates keep ``GuardOutcome.NOT_EVALUATED``.
+        """
+        tracer = self.tracer
+        if not tracer.enabled:
+            return
+        found = False
+        for s in chain([state], state.ancestors()):
+            for transition in s.transitions:
+                if transition is winner:
+                    found = True
+                elif (
+                    found
+                    and not transition.initial
+                    and predicate(transition, trigger_data.event)
+                ):
+                    tracer.record_shadowed(transition, state, winner)
+
     def _select_transitions(
-        self, trigger_data: TriggerData, predicate: Callable
+        self, trigger_data: TriggerData, predicate: Callable, kind: str
     ) -> OrderedSet[Transition]:
         """Select the transitions that match the trigger data."""
+        event = trigger_data.event
+        self.tracer.begin_microstep(str(event) if event is not None else None, kind)
         enabled_transitions = OrderedSet[Transition]()
 
         # Get atomic states, TODO: sorted by document order
@@ -374,6 +421,7 @@ class BaseEngine:
         This includes exiting states, executing transition content, and entering states.
         """
         self._microstep_count += 1
+        self.tracer.record_execution(transitions)
         self._debug(
             "%s macro:%d micro:%d transitions: %s",
             self._log_id,
