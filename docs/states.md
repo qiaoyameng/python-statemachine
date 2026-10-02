@@ -41,6 +41,7 @@ True
 | `enter` | `None` | Callback(s) to run when entering this state. See {ref}`state-actions`. |
 | `exit` | `None` | Callback(s) to run when leaving this state. See {ref}`state-actions`. |
 | `invoke` | `None` | Background work spawned on entry, cancelled on exit. See {ref}`invoke-actions`. |
+| `local_data` | `None` | Zero-argument factory that creates data scoped to one state entry. |
 
 ```py
 >>> class CampaignMachine(StateChart):
@@ -94,6 +95,72 @@ You can query the list of all declared final states:
 See {ref}`validations` for the checks the library performs at class definition
 time — including final state reachability, unreachable states, and trap states.
 ```
+
+
+(state-local-data)=
+
+## State-local data
+
+State-local data belongs to one activation of a state. The library creates it
+immediately before entry callbacks run and releases it when the state exits:
+
+```py
+>>> class Review(StateChart):
+...     waiting = State(initial=True, local_data=lambda: {"notes": []})
+...     approved = State(final=True, local_data=lambda: {"notes": []})
+...     approve = waiting.to(approved)
+...
+...     def on_enter_waiting(self, local_data):
+...         local_data["notes"].append("created for this review")
+
+>>> sm = Review()
+>>> sm.send("approve")
+
+```
+
+Declare a mapping of factories when a state needs several local values:
+
+```py
+>>> waiting = State(local_data={"items": list, "attempts": int})
+
+```
+
+Each machine and each re-entry calls the factory again. This avoids mutable
+defaults shared by multiple machines or by previous activations.
+
+Inside a child state, `local_data` reads through active ancestor states. A
+write creates or replaces the key only in the current state's frame; it does
+not mutate the parent:
+
+```py
+>>> class CompoundReview(StateChart):
+...     class review(State.Compound, local_data=lambda: {"decision": "pending"}):
+...         waiting = State(initial=True)
+...         done = State(final=True)
+...         decide = waiting.to(done)
+...     idle = State(initial=True)
+...     start = idle.to(review)
+...
+...     def on_enter_waiting(self, local_data):
+...         assert local_data["decision"] == "pending"
+...         local_data["decision"] = "approved"
+...         assert local_data["decision"] == "approved"
+...
+...     def on_exit_review(self, local_data):
+...         assert local_data["decision"] == "pending"
+
+>>> sm = CompoundReview()
+>>> sm.send("start")
+>>> sm.send("decide")
+
+```
+
+Parallel regions each receive their own frame. A callback may retain a
+{class}`~statemachine.StateLocalData` reference, but after exit that reference
+is a read-only snapshot. Later writes raise a
+{class}`~statemachine.exceptions.StateMachineError`. Internal transitions reuse
+the current frame; external self-transitions and history re-entry create a new
+one.
 
 
 (compound-states)=

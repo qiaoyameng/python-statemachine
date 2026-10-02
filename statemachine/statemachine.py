@@ -28,6 +28,7 @@ from .exceptions import TransitionNotAllowed
 from .factory import StateMachineMetaclass
 from .graph import iterate_states_and_transitions
 from .i18n import _
+from .local_data import LocalDataManager
 from .model import Model
 from .signature import SignatureAdapter
 from .state import InstanceState
@@ -159,6 +160,7 @@ class StateChart(Generic[TModel], metaclass=StateMachineMetaclass):
             [start_value] if start_value is not None else list(self.start_configuration_values)
         )
         self._callbacks = CallbacksRegistry()
+        self._local_data = LocalDataManager()
         self._config = self._build_configuration()
         self._listeners: dict[int, Any] = {}
         """Listeners that provides attributes to be used as callbacks."""
@@ -261,6 +263,7 @@ class StateChart(Generic[TModel], metaclass=StateMachineMetaclass):
         listeners = state.pop("_listeners")
         self.__dict__.update(state)  # type: ignore[attr-defined]
         self._callbacks = CallbacksRegistry()
+        self._local_data = LocalDataManager()
         self._config = self._build_configuration()
         self._listeners = {}
 

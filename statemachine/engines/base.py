@@ -382,15 +382,22 @@ class BaseEngine:
             transitions,
         )
         previous_configuration = self.sm.configuration
+        local_data_frames = None
         try:
             result = self._execute_transition_content(
                 transitions, trigger_data, lambda t: t.before.key
             )
 
-            states_to_exit = self._exit_states(transitions, trigger_data)
-            result += self._enter_states(
-                transitions, trigger_data, states_to_exit, previous_configuration
-            )
+            try:
+                states_to_exit = self._exit_states(transitions, trigger_data)
+                local_data_frames, result_entries = self._enter_states(
+                    transitions, trigger_data, states_to_exit, previous_configuration
+                )
+                result += result_entries
+            except Exception:
+                if local_data_frames is not None:
+                    self.sm._local_data.rollback(local_data_frames)
+                raise
         except InvalidDefinition:
             self.sm.configuration = previous_configuration
             raise
@@ -410,6 +417,8 @@ class BaseEngine:
             raise
         except Exception as e:
             self._handle_error(e, trigger_data)
+
+        self.sm._local_data.clear_released()
 
         if len(result) == 0:
             result = None
@@ -445,6 +454,11 @@ class BaseEngine:
             event_data.source = source
 
         args, kwargs = event_data.args, event_data.extended_kwargs
+
+        local_state = target or source or event_data.state
+        local_data = self.sm._local_data.context_for(local_state)
+        if local_data is not None:
+            kwargs["local_data"] = local_data
 
         result = self.sm._callbacks.call(self.sm.prepare.key, *args, **kwargs)
         for new_kwargs in result:
@@ -519,8 +533,16 @@ class BaseEngine:
                 self.sm._callbacks.call(info.state.exit.key, *args, on_error=on_error, **kwargs)
 
             self._remove_state_from_configuration(info.state)
+            self.sm._local_data.release([info.state])
 
         return result
+
+    def _activate_local_data(self, ordered_states: list[StateTransition]):
+        states = [info.state for info in ordered_states if info.state is not None]
+        frames = self.sm._local_data.build_frames(states)
+        self.sm._local_data.activate(frames)
+        self.clear_cache()
+        return frames
 
     def _execute_transition_content(
         self,
@@ -645,7 +667,6 @@ class BaseEngine:
         ordered_states, states_for_default_entry, default_history_content, new_configuration = (
             self._prepare_entry_states(enabled_transitions, states_to_exit, previous_configuration)
         )
-
         # For transition 'on' content, use on_error only for non-error.execution
         # events.  During error.execution processing, errors in transition content
         # must propagate to microstep() where _send_error_execution's guard
@@ -658,67 +679,71 @@ class BaseEngine:
             and str(trigger_data.event) == _ERROR_EXECUTION
         ):
             on_error_transition = None
-
-        result = self._execute_transition_content(
-            enabled_transitions,
-            trigger_data,
-            lambda t: t.on.key,
-            on_error=on_error_transition,
-            previous_configuration=previous_configuration,
-            new_configuration=new_configuration,
-        )
-
-        if self.sm.atomic_configuration_update:
-            self.sm.configuration = new_configuration
-
-        for info in ordered_states:
-            target = info.state
-            transition = info.transition
-            args, kwargs = self._get_args_kwargs(
-                transition,
+        local_data_frames = self._activate_local_data(ordered_states)
+        try:
+            result = self._execute_transition_content(
+                enabled_transitions,
                 trigger_data,
-                target=target,
+                lambda t: t.on.key,
+                on_error=on_error_transition,
+                previous_configuration=previous_configuration,
+                new_configuration=new_configuration,
             )
 
-            self._debug("%s Entering state: %s", self._log_id, target)
-            self._add_state_to_configuration(target)
+            if self.sm.atomic_configuration_update:
+                self.sm.configuration = new_configuration
 
-            # Execute `onentry` handlers — each handler is a separate block per
-            # SCXML spec: errors in one block MUST NOT affect other blocks.
-            on_entry_result = self.sm._callbacks.call(
-                target.enter.key, *args, on_error=on_error, **kwargs
-            )
-
-            # Handle default initial states
-            if target.id in {t.state.id for t in states_for_default_entry if t.state}:
-                initial_transitions = [t for t in target.transitions if t.initial]
-                if len(initial_transitions) == 1:
-                    result += self.sm._callbacks.call(
-                        initial_transitions[0].on.key, *args, **kwargs
-                    )
-
-            # Handle default history states
-            default_history_transitions = [
-                i.transition for i in default_history_content.get(target.id, [])
-            ]
-            if default_history_transitions:
-                self._execute_transition_content(
-                    default_history_transitions,
+            for info in ordered_states:
+                target = info.state
+                transition = info.transition
+                args, kwargs = self._get_args_kwargs(
+                    transition,
                     trigger_data,
-                    lambda t: t.on.key,
-                    previous_configuration=previous_configuration,
-                    new_configuration=new_configuration,
+                    target=target,
                 )
 
-            # Mark state for invocation if it has invoke callbacks registered
-            if target.invoke.key in self.sm._callbacks:
-                self._invoke_manager.mark_for_invoke(target, trigger_data.kwargs)
+                self._debug("%s Entering state: %s", self._log_id, target)
+                self._add_state_to_configuration(target)
 
-            # Handle final states
-            if target.final:
-                self._handle_final_state(target, on_entry_result)
+                # Execute `onentry` handlers — each handler is a separate block per
+                # SCXML spec: errors in one block MUST NOT affect other blocks.
+                on_entry_result = self.sm._callbacks.call(
+                    target.enter.key, *args, on_error=on_error, **kwargs
+                )
 
-        return result
+                # Handle default initial states
+                if target.id in {t.state.id for t in states_for_default_entry if t.state}:
+                    initial_transitions = [t for t in target.transitions if t.initial]
+                    if len(initial_transitions) == 1:
+                        result += self.sm._callbacks.call(
+                            initial_transitions[0].on.key, *args, **kwargs
+                        )
+
+                # Handle default history states
+                default_history_transitions = [
+                    i.transition for i in default_history_content.get(target.id, [])
+                ]
+                if default_history_transitions:
+                    self._execute_transition_content(
+                        default_history_transitions,
+                        trigger_data,
+                        lambda t: t.on.key,
+                        previous_configuration=previous_configuration,
+                        new_configuration=new_configuration,
+                    )
+
+                # Mark state for invocation if it has invoke callbacks registered
+                if target.invoke.key in self.sm._callbacks:
+                    self._invoke_manager.mark_for_invoke(target, trigger_data.kwargs)
+
+                # Handle final states
+                if target.final:
+                    self._handle_final_state(target, on_entry_result)
+        except Exception:
+            self.sm._local_data.rollback(local_data_frames)
+            raise
+
+        return local_data_frames, result
 
     def compute_entry_set(
         self, transitions, states_to_enter, states_for_default_entry, default_history_content

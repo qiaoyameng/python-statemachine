@@ -207,6 +207,7 @@ These parameters are available for injection into any callback:
 | `model` | {class}`~statemachine.model.Model` | The underlying model instance (see {ref}`models`). |
 | `machine` | {class}`~statemachine.statemachine.StateChart` | The state machine instance itself. |
 | `transition` | {class}`~statemachine.transition.Transition` | The transition being executed. |
+| `local_data` | {class}`~statemachine.StateLocalData` | State-local data for the callback's state, reading ancestor state frames. See {ref}`state-local-data`. |
 
 The following parameters are available **only in `on` callbacks** (transition
 content):

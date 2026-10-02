@@ -1,4 +1,5 @@
 from .event import Event
+from .local_data import StateLocalData
 from .state import HistoryState
 from .state import HistoryType
 from .state import State
@@ -17,5 +18,6 @@ __all__ = [
     "HistoryState",
     "HistoryType",
     "Event",
+    "StateLocalData",
     "TModel",
 ]

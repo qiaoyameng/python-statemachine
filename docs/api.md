@@ -31,6 +31,13 @@
     :members:
 ```
 
+## StateLocalData
+
+```{eval-rst}
+.. autoclass:: statemachine.local_data.StateLocalData
+    :members:
+```
+
 ## HistoryState
 
 ```{versionadded} 3.0.0
