@@ -10,11 +10,16 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
+from ..compensation import CompensationManager
+from ..compensation import get_action_meta
 from ..event import BoundEvent
 from ..event_data import EventData
 from ..event_data import TriggerData
+from ..exceptions import CompensationError
 from ..exceptions import InvalidDefinition
 from ..exceptions import TransitionNotAllowed
+from ..exceptions import UnsupportedCompensableAction
+from ..i18n import _
 from ..invoke import InvokeManager
 from ..orderedset import OrderedSet
 from ..state import HistoryState
@@ -54,6 +59,16 @@ class EventQueue:
     def clear(self):
         with self.queue.mutex:
             self.queue.queue.clear()
+
+    def snapshot(self) -> list:
+        """Return a copy of the queued triggers (used by compensable microsteps)."""
+        with self.queue.mutex:
+            return list(self.queue.queue)
+
+    def restore(self, items: list):
+        """Restore a snapshot taken by :meth:`snapshot`."""
+        with self.queue.mutex:
+            self.queue.queue = list(items)
 
     def reject_futures(self, exc: Exception):
         """Reject all unresolved futures in the queue.
@@ -96,6 +111,222 @@ class BaseEngine:
         self._log_id = f"[{type(sm).__name__}]"
         self._debug = logger.debug if logger.isEnabledFor(logging.DEBUG) else lambda *a, **k: None
         self._root_parallel_final_pending: "State | None" = None
+        self._compensation: "CompensationManager | None" = None
+
+    # -- Compensable microstep seam ----------------------------------------
+
+    def _callbacks_call(self, key: str, *args, **kwargs):
+        """Invoke an action-group executor, tracking compensation when enabled.
+
+        When a :class:`CompensationManager` is active for the current microstep,
+        every matching callback runs through it: its result is recorded and
+        exceptions propagate immediately (``on_error`` is ignored) so the
+        microstep can roll back.
+        """
+        manager = self._compensation
+        if manager is None or key not in self.sm._callbacks:
+            return self.sm._callbacks.call(key, *args, **kwargs)
+
+        results = []
+        executor = self.sm._callbacks[key]
+        for callback in executor:
+            if callback.condition(*args, **kwargs):
+                results.append(manager.track_sync(callback, args, kwargs))
+        return results
+
+    @property
+    def compensable(self) -> bool:
+        return self.sm.compensable_microstep
+
+    def _compensable_call_specs(
+        self,
+        transitions: list[Transition],
+        trigger_data: TriggerData,
+        ordered_exit_states: list[StateTransition],
+        ordered_enter_states: list[StateTransition],
+        states_for_default_entry: OrderedSet[StateTransition],
+        default_history_content: dict[str, Any],
+    ) -> "tuple[list, set[str], set[str]]":
+        """Build the ordered action specs validated before execution.
+
+        Each item is ``(callback_key, transition, target, source)``; the
+        (possibly async) engine resolves its injected args via
+        ``_get_args_kwargs``. Also returns the entered and exited state ids used
+        for the ``invoke`` rejection.
+        """
+        specs: list[tuple[str, Transition, "State | None", "State | None"]] = []
+
+        for transition in transitions:
+            specs.append((transition.before.key, transition, None, None))
+            specs.append((transition.on.key, transition, None, None))
+
+        for info in ordered_exit_states:
+            if info.state is None:
+                continue
+            specs.append((info.state.exit.key, info.transition, None, info.state))
+
+        for info in states_for_default_entry:
+            if info.state is None:
+                continue
+            for initial in (t for t in info.state.transitions if t.initial):
+                specs.append((initial.on.key, initial, info.state, None))
+
+        for entries in default_history_content.values():
+            for info in entries:
+                specs.append((info.transition.on.key, info.transition, None, None))
+
+        for info in ordered_enter_states:
+            if info.state is None:
+                continue
+            specs.append((info.state.enter.key, info.transition, info.state, None))
+
+        entered_ids = {
+            info.state.id for info in ordered_enter_states if info.state is not None
+        }
+        exited_ids = {
+            info.state.id for info in ordered_exit_states if info.state is not None
+        }
+        return specs, entered_ids, exited_ids
+
+    def _check_compensable_calls(self, calls, entered_ids, exited_ids) -> None:
+        """Apply the side-effect-free/compensable and invoke rules to resolved calls."""
+        registry = self.sm._callbacks
+        for key, args, kwargs in calls:
+            executor = registry._registry.get(key)
+            if executor is None:
+                continue
+            for callback in executor:
+                if not callback.condition(*args, **kwargs):
+                    continue
+                meta = get_action_meta(callback._callback)
+                if meta is None:
+                    raise UnsupportedCompensableAction(
+                        _(
+                            "Action '{name}' runs in a compensable microstep but is not "
+                            "declared side-effect-free nor registered with a compensation "
+                            "function."
+                        ).format(name=getattr(callback._callback, "__name__", callback))
+                    )
+
+        invoke_states = self._states_with_real_invoke()
+        for state_id in (entered_ids | exited_ids) & invoke_states:
+            phase = "enter" if state_id in entered_ids else "exit"
+            raise UnsupportedCompensableAction(
+                _(
+                    "Cannot {phase} state '{state}' in a compensable microstep: invoke "
+                    "actions are not supported and cannot be compensated."
+                ).format(phase=phase, state=state_id)
+            )
+
+    def _states_with_real_invoke(self) -> set[str]:
+        """State ids declaring genuine invoke handlers (excluding naming-convention specs).
+
+        Each state's invoke executor mixes the generic ``on_invoke_state``
+        callback (shared by every state) with the state-specific
+        ``on_invoke_<state>`` one. Only a wrapper that resolves the
+        state-specific name, or an inline invoke handler, means real invoke
+        work for *this* state.
+        """
+        registry = self.sm._callbacks
+        result: set[str] = set()
+        for state in self.sm.states_map.values():
+            executor = registry._registry.get(state.invoke.key)
+            if executor is None:
+                continue
+            specific_name = f"on_invoke_{state.id}"
+            for wrapper in executor:
+                unique_key = wrapper.unique_key
+                if not wrapper.meta.is_convention:
+                    result.add(state.id)
+                    break
+                if unique_key.startswith(f"{specific_name}@"):
+                    result.add(state.id)
+                    break
+        return result
+
+    def _validate_compensable(
+        self,
+        transitions: list[Transition],
+        trigger_data: TriggerData,
+        ordered_exit_states: list[StateTransition],
+        ordered_enter_states: list[StateTransition],
+        states_for_default_entry: OrderedSet[StateTransition],
+        default_history_content: dict[str, Any],
+    ) -> None:
+        """Reject the microstep before execution if any action cannot be compensated.
+
+        Every callback that will fire in the ``before``/``exit``/``on``/``enter``
+        groups must be declared side-effect-free or compensable, and entered
+        states must not declare ``invoke`` handlers.
+        """
+        specs, entered_ids, exited_ids = self._compensable_call_specs(
+            transitions,
+            trigger_data,
+            ordered_exit_states,
+            ordered_enter_states,
+            states_for_default_entry,
+            default_history_content,
+        )
+        calls = []
+        for key, transition, target, source in specs:
+            args, kwargs = self._get_args_kwargs(
+                transition, trigger_data, target=target, source=source
+            )
+            calls.append((key, args, kwargs))
+        self._check_compensable_calls(calls, entered_ids, exited_ids)
+
+    def _compensate_and_raise(
+        self,
+        manager: CompensationManager,
+        snapshot,
+        error: BaseException,
+        trigger_data: TriggerData,
+    ) -> None:
+        """Restore the pre-microstep state, undo successful actions, raise.
+
+        Compensation errors never shadow the original failure: when present, the
+        original error is wrapped in a :class:`CompensationError`; otherwise the
+        original error propagates unchanged. Non-exception exits (e.g.
+        ``asyncio.CancelledError`` on the async engine) are re-raised as-is with
+        the compensation errors attached, so cancellation semantics survive.
+        """
+        manager.restore(snapshot)
+        compensation_errors = manager.run_compensations()
+        if compensation_errors:
+            if isinstance(error, Exception):
+                raise CompensationError(error, compensation_errors) from error
+            logger.warning(
+                "%s Compensation errors while handling %r: %r",
+                self._log_id,
+                error,
+                compensation_errors,
+            )
+            error.compensation_errors = compensation_errors  # type: ignore[attr-defined]
+        raise error
+
+    def _enter_initial_compensable(self, transitions, trigger_data):
+        """Run initial state entry as a compensable microstep (sync engine)."""
+        manager = CompensationManager(self)
+        snapshot = manager.snapshot()
+        prepared_entry = self._prepare_entry_states(transitions, OrderedSet(), OrderedSet())
+        self._validate_compensable(
+            transitions,
+            trigger_data,
+            [],
+            prepared_entry[0],
+            prepared_entry[1],
+            prepared_entry[2],
+        )
+        self._compensation = manager
+        try:
+            self._enter_states(
+                transitions, trigger_data, OrderedSet(), OrderedSet(), prepared=prepared_entry
+            )
+        except BaseException as error:
+            self._compensation = None
+            self._compensate_and_raise(manager, snapshot, error, trigger_data)
+        finally:
+            self._compensation = None
 
     def empty(self):  # pragma: no cover
         return self.external_queue.is_empty()
@@ -382,22 +613,64 @@ class BaseEngine:
             transitions,
         )
         previous_configuration = self.sm.configuration
+        compensable = self.compensable
+        manager = CompensationManager(self) if compensable else None
+        prepared_exit = None
+        prepared_entry = None
+        snapshot = None
+        if compensable:
+            assert manager is not None
+            snapshot = manager.snapshot()
+            prepared_exit = self._prepare_exit_states(transitions)
+            prepared_entry = self._prepare_entry_states(
+                transitions, prepared_exit[1], previous_configuration
+            )
+            self._validate_compensable(
+                transitions,
+                trigger_data,
+                prepared_exit[0],
+                prepared_entry[0],
+                prepared_entry[1],
+                prepared_entry[2],
+            )
+            self._compensation = manager
         try:
             result = self._execute_transition_content(
                 transitions, trigger_data, lambda t: t.before.key
             )
 
-            states_to_exit = self._exit_states(transitions, trigger_data)
+            states_to_exit = self._exit_states(transitions, trigger_data, prepared=prepared_exit)
             result += self._enter_states(
-                transitions, trigger_data, states_to_exit, previous_configuration
+                transitions,
+                trigger_data,
+                states_to_exit,
+                previous_configuration,
+                prepared=prepared_entry,
             )
-        except InvalidDefinition:
+        except InvalidDefinition as e:
+            if compensable:
+                assert manager is not None and snapshot is not None
+                self._compensation = None  # undos must not be re-tracked
+                self._compensate_and_raise(manager, snapshot, e, trigger_data)
             self.sm.configuration = previous_configuration
             raise
         except Exception as e:
+            if compensable:
+                assert manager is not None and snapshot is not None
+                self._compensation = None
+                self._compensate_and_raise(manager, snapshot, e, trigger_data)
             self.sm.configuration = previous_configuration
             self._handle_error(e, trigger_data)
             return None
+        except BaseException as e:
+            if compensable:
+                assert manager is not None and snapshot is not None
+                self._compensation = None
+                self._compensate_and_raise(manager, snapshot, e, trigger_data)
+            raise
+        finally:
+            if compensable:
+                self._compensation = None
 
         try:
             self._execute_transition_content(
@@ -500,10 +773,15 @@ class BaseEngine:
             self.sm._config.discard(state)
 
     def _exit_states(
-        self, enabled_transitions: list[Transition], trigger_data: TriggerData
+        self,
+        enabled_transitions: list[Transition],
+        trigger_data: TriggerData,
+        prepared: "tuple[list[StateTransition], OrderedSet[State]] | None" = None,
     ) -> OrderedSet[State]:
         """Compute and process the states to exit for the given transitions."""
-        ordered_states, result = self._prepare_exit_states(enabled_transitions)
+        ordered_states, result = (
+            prepared if prepared is not None else self._prepare_exit_states(enabled_transitions)
+        )
         on_error = self._on_error_handler()
 
         for info in ordered_states:
@@ -516,7 +794,9 @@ class BaseEngine:
             # Execute `onexit` handlers — same per-block error isolation as onentry.
             if info.state is not None:  # pragma: no branch
                 self._debug("%s Exiting state: %s", self._log_id, info.state)
-                self.sm._callbacks.call(info.state.exit.key, *args, on_error=on_error, **kwargs)
+                self._callbacks_call(
+                    info.state.exit.key, *args, on_error=on_error, **kwargs
+                )
 
             self._remove_state_from_configuration(info.state)
 
@@ -540,7 +820,7 @@ class BaseEngine:
             )
             kwargs.update(kwargs_extra)
 
-            result += self.sm._callbacks.call(get_key(transition), *args, **kwargs)
+            result += self._callbacks_call(get_key(transition), *args, **kwargs)
 
         return result
 
@@ -639,12 +919,26 @@ class BaseEngine:
         trigger_data: TriggerData,
         states_to_exit: OrderedSet[State],
         previous_configuration: OrderedSet[State],
+        prepared=None,
     ):
         """Enter the states as determined by the given transitions."""
         on_error = self._on_error_handler()
-        ordered_states, states_for_default_entry, default_history_content, new_configuration = (
-            self._prepare_entry_states(enabled_transitions, states_to_exit, previous_configuration)
-        )
+        if prepared is None:
+            (
+                ordered_states,
+                states_for_default_entry,
+                default_history_content,
+                new_configuration,
+            ) = self._prepare_entry_states(
+                enabled_transitions, states_to_exit, previous_configuration
+            )
+        else:
+            (
+                ordered_states,
+                states_for_default_entry,
+                default_history_content,
+                new_configuration,
+            ) = prepared
 
         # For transition 'on' content, use on_error only for non-error.execution
         # events.  During error.execution processing, errors in transition content
@@ -685,7 +979,7 @@ class BaseEngine:
 
             # Execute `onentry` handlers — each handler is a separate block per
             # SCXML spec: errors in one block MUST NOT affect other blocks.
-            on_entry_result = self.sm._callbacks.call(
+            on_entry_result = self._callbacks_call(
                 target.enter.key, *args, on_error=on_error, **kwargs
             )
 
@@ -693,7 +987,7 @@ class BaseEngine:
             if target.id in {t.state.id for t in states_for_default_entry if t.state}:
                 initial_transitions = [t for t in target.transitions if t.initial]
                 if len(initial_transitions) == 1:
-                    result += self.sm._callbacks.call(
+                    result += self._callbacks_call(
                         initial_transitions[0].on.key, *args, **kwargs
                     )
 

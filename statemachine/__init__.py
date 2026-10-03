@@ -1,3 +1,5 @@
+from .compensation import compensable
+from .compensation import side_effect_free
 from .event import Event
 from .state import HistoryState
 from .state import HistoryType
@@ -17,5 +19,7 @@ __all__ = [
     "HistoryState",
     "HistoryType",
     "Event",
+    "compensable",
+    "side_effect_free",
     "TModel",
 ]

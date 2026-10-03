@@ -41,3 +41,27 @@ class TransitionNotAllowed(StateMachineError):
             self.event and self.event.name or "transition", name
         )
         super().__init__(msg)
+
+
+class UnsupportedCompensableAction(InvalidDefinition):
+    "A compensable microstep contains an action that cannot be safely compensated."
+
+
+class CompensationError(StateMachineError):
+    """A compensable microstep failed and one or more compensations also failed.
+
+    The original failure is preserved as :attr:`original_error`, and every
+    exception raised by compensation callbacks is collected in
+    :attr:`compensation_errors` (in compensation order). Compensation of the
+    remaining successful actions always runs to completion, so this single
+    exception reports the full picture.
+    """
+
+    def __init__(self, original_error: Exception, compensation_errors: list[BaseException]):
+        self.original_error = original_error
+        self.compensation_errors = list(compensation_errors)
+        detail = ", ".join(type(error).__name__ for error in compensation_errors)
+        super().__init__(
+            f"Microstep failed with {original_error!r}; compensation also failed "
+            f"({len(compensation_errors)} error(s): {detail})."
+        )

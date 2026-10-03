@@ -51,7 +51,10 @@ class SyncEngine(BaseEngine):
             transitions = self._initial_transitions(trigger_data)
             self._processing.acquire(blocking=False)
             try:
-                self._enter_states(transitions, trigger_data, OrderedSet(), OrderedSet())
+                if self.compensable:
+                    self._enter_initial_compensable(transitions, trigger_data)
+                else:
+                    self._enter_states(transitions, trigger_data, OrderedSet(), OrderedSet())
             finally:
                 self._processing.release()
         return self.processing_loop()

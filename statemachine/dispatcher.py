@@ -7,6 +7,7 @@ from operator import attrgetter
 from typing import TYPE_CHECKING
 from typing import Any
 
+from .callbacks import ACTION_META_ATTR
 from .callbacks import SPECS_ALL
 from .callbacks import SpecReference
 from .callbacks import allways_true
@@ -211,6 +212,12 @@ def callable_method(a_callable) -> Callable:
     signature_adapter.__name__ = metadata_to_copy.__name__
     signature_adapter.__doc__ = metadata_to_copy.__doc__
     signature_adapter.is_coroutine = sig.is_coroutine  # type: ignore[attr-defined]
+
+    # Propagate compensable-microstep metadata (set via @compensable /
+    # @side_effect_free) so the engine can inspect the resolved adapter.
+    action_meta = getattr(metadata_to_copy, ACTION_META_ATTR, None)
+    if action_meta is not None:
+        setattr(signature_adapter, ACTION_META_ATTR, action_meta)
 
     return signature_adapter
 

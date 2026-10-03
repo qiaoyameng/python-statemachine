@@ -1,10 +1,13 @@
 import asyncio
+import logging
 import contextvars
 from collections.abc import Callable
 from itertools import chain
 from time import time
 from typing import TYPE_CHECKING
 
+from ..compensation import CompensationManager
+from ..exceptions import CompensationError
 from ..event_data import EventData
 from ..event_data import TriggerData
 from ..exceptions import InvalidDefinition
@@ -25,6 +28,8 @@ if TYPE_CHECKING:
 _in_processing_loop: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_in_processing_loop", default=False
 )
+
+logger = logging.getLogger(__name__)
 
 
 class AsyncEngine(BaseEngine):
@@ -69,6 +74,19 @@ class AsyncEngine(BaseEngine):
         self.external_queue.reject_futures(exc)
 
     # --- Callback dispatch overrides (async versions of BaseEngine methods) ---
+
+    async def _callbacks_call(self, key: str, *args, **kwargs):  # type: ignore[override]
+        """Async counterpart of the sync compensable-microstep seam."""
+        manager = self._compensation
+        if manager is None or key not in self.sm._callbacks:
+            return await self.sm._callbacks.async_call(key, *args, **kwargs)
+
+        results = []
+        executor = self.sm._callbacks[key]
+        for callback in executor:
+            if callback.condition(*args, **kwargs):
+                results.append(await manager.track_async(callback, args, kwargs))
+        return results
 
     async def _get_args_kwargs(
         self,
@@ -150,7 +168,7 @@ class AsyncEngine(BaseEngine):
     async def select_transitions(self, trigger_data: TriggerData) -> "OrderedSet[Transition]":  # type: ignore[override]
         return await self._select_transitions(trigger_data, lambda t, e: t.match(e))
 
-    async def _execute_transition_content(
+    async def _execute_transition_content(  # type: ignore[override]
         self,
         enabled_transitions: "list[Transition]",
         trigger_data: TriggerData,
@@ -168,14 +186,19 @@ class AsyncEngine(BaseEngine):
             )
             kwargs.update(kwargs_extra)
 
-            result += await self.sm._callbacks.async_call(get_key(transition), *args, **kwargs)
+            result += await self._callbacks_call(get_key(transition), *args, **kwargs)
 
         return result
 
     async def _exit_states(  # type: ignore[override]
-        self, enabled_transitions: "list[Transition]", trigger_data: TriggerData
+        self,
+        enabled_transitions: "list[Transition]",
+        trigger_data: TriggerData,
+        prepared=None,
     ) -> "OrderedSet[State]":
-        ordered_states, result = self._prepare_exit_states(enabled_transitions)
+        ordered_states, result = (
+            prepared if prepared is not None else self._prepare_exit_states(enabled_transitions)
+        )
         on_error = self._on_error_handler()
 
         for info in ordered_states:
@@ -189,7 +212,7 @@ class AsyncEngine(BaseEngine):
 
             if info.state is not None:  # pragma: no branch
                 self._debug("%s Exiting state: %s", self._log_id, info.state)
-                await self.sm._callbacks.async_call(
+                await self._callbacks_call(
                     info.state.exit.key, *args, on_error=on_error, **kwargs
                 )
 
@@ -203,11 +226,25 @@ class AsyncEngine(BaseEngine):
         trigger_data: TriggerData,
         states_to_exit: "OrderedSet[State]",
         previous_configuration: "OrderedSet[State]",
+        prepared=None,
     ):
         on_error = self._on_error_handler()
-        ordered_states, states_for_default_entry, default_history_content, new_configuration = (
-            self._prepare_entry_states(enabled_transitions, states_to_exit, previous_configuration)
-        )
+        if prepared is None:
+            (
+                ordered_states,
+                states_for_default_entry,
+                default_history_content,
+                new_configuration,
+            ) = self._prepare_entry_states(
+                enabled_transitions, states_to_exit, previous_configuration
+            )
+        else:
+            (
+                ordered_states,
+                states_for_default_entry,
+                default_history_content,
+                new_configuration,
+            ) = prepared
 
         # For transition 'on' content, use on_error only for non-error.execution
         # events.  During error.execution processing, errors in transition content
@@ -246,7 +283,7 @@ class AsyncEngine(BaseEngine):
             self._debug("%s Entering state: %s", self._log_id, target)
             self._add_state_to_configuration(target)
 
-            on_entry_result = await self.sm._callbacks.async_call(
+            on_entry_result = await self._callbacks_call(
                 target.enter.key, *args, on_error=on_error, **kwargs
             )
 
@@ -254,7 +291,7 @@ class AsyncEngine(BaseEngine):
             if target.id in {t.state.id for t in states_for_default_entry if t.state}:
                 initial_transitions = [t for t in target.transitions if t.initial]
                 if len(initial_transitions) == 1:
-                    result += await self.sm._callbacks.async_call(
+                    result += await self._callbacks_call(
                         initial_transitions[0].on.key, *args, **kwargs
                     )
 
@@ -291,22 +328,66 @@ class AsyncEngine(BaseEngine):
             transitions,
         )
         previous_configuration = self.sm.configuration
+        compensable = self.compensable
+        manager = CompensationManager(self) if compensable else None
+        prepared_exit = None
+        prepared_entry = None
+        snapshot = None
+        if compensable:
+            assert manager is not None
+            snapshot = manager.snapshot()
+            prepared_exit = self._prepare_exit_states(transitions)
+            prepared_entry = self._prepare_entry_states(
+                transitions, prepared_exit[1], previous_configuration
+            )
+            await self._validate_compensable(
+                transitions,
+                trigger_data,
+                prepared_exit[0],
+                prepared_entry[0],
+                prepared_entry[1],
+                prepared_entry[2],
+            )
+            self._compensation = manager
         try:
             result = await self._execute_transition_content(
                 transitions, trigger_data, lambda t: t.before.key
             )
 
-            states_to_exit = await self._exit_states(transitions, trigger_data)
-            result += await self._enter_states(
-                transitions, trigger_data, states_to_exit, previous_configuration
+            states_to_exit = await self._exit_states(
+                transitions, trigger_data, prepared=prepared_exit
             )
-        except InvalidDefinition:
+            result += await self._enter_states(
+                transitions,
+                trigger_data,
+                states_to_exit,
+                previous_configuration,
+                prepared=prepared_entry,
+            )
+        except InvalidDefinition as e:
+            if compensable:
+                assert manager is not None and snapshot is not None
+                self._compensation = None  # undos must not be re-tracked
+                await self._compensate_and_raise_async(manager, snapshot, e, trigger_data)
             self.sm.configuration = previous_configuration
             raise
         except Exception as e:
+            if compensable:
+                assert manager is not None and snapshot is not None
+                self._compensation = None
+                await self._compensate_and_raise_async(manager, snapshot, e, trigger_data)
             self.sm.configuration = previous_configuration
             self._handle_error(e, trigger_data)
             return None
+        except BaseException as e:
+            if compensable:
+                assert manager is not None and snapshot is not None
+                self._compensation = None
+                await self._compensate_and_raise_async(manager, snapshot, e, trigger_data)
+            raise
+        finally:
+            if compensable:
+                self._compensation = None
 
         try:
             await self._execute_transition_content(
@@ -326,6 +407,70 @@ class AsyncEngine(BaseEngine):
             result = result[0]
 
         return result
+
+    async def _compensate_and_raise_async(self, manager, snapshot, error, trigger_data):
+        """Async counterpart of the sync ``_compensate_and_raise``."""
+        manager.restore(snapshot)
+        compensation_errors = await manager.run_compensations_async()
+        if compensation_errors:
+            if isinstance(error, Exception):
+                raise CompensationError(error, compensation_errors) from error
+            logger.warning(
+                "Compensation errors while handling %r: %r",
+                error,
+                compensation_errors,
+            )
+            error.compensation_errors = compensation_errors
+        raise error
+
+    async def _validate_compensable(  # type: ignore[override]
+        self,
+        transitions,
+        trigger_data,
+        ordered_exit_states,
+        ordered_enter_states,
+        states_for_default_entry,
+        default_history_content,
+    ):
+        specs, entered_ids, exited_ids = self._compensable_call_specs(
+            transitions,
+            trigger_data,
+            ordered_exit_states,
+            ordered_enter_states,
+            states_for_default_entry,
+            default_history_content,
+        )
+        calls = []
+        for key, transition, target, source in specs:
+            args, kwargs = await self._get_args_kwargs(
+                transition, trigger_data, target=target, source=source
+            )
+            calls.append((key, args, kwargs))
+        self._check_compensable_calls(calls, entered_ids, exited_ids)
+
+    async def _enter_initial_compensable(self, transitions, trigger_data):
+        """Run initial state entry as a compensable microstep (async engine)."""
+        manager = CompensationManager(self)
+        snapshot = manager.snapshot()
+        prepared_entry = self._prepare_entry_states(transitions, OrderedSet(), OrderedSet())
+        await self._validate_compensable(
+            transitions,
+            trigger_data,
+            [],
+            prepared_entry[0],
+            prepared_entry[1],
+            prepared_entry[2],
+        )
+        self._compensation = manager
+        try:
+            await self._enter_states(
+                transitions, trigger_data, OrderedSet(), OrderedSet(), prepared=prepared_entry
+            )
+        except BaseException as error:
+            self._compensation = None
+            await self._compensate_and_raise_async(manager, snapshot, error, trigger_data)
+        finally:
+            self._compensation = None
 
     # --- Engine loop ---
 
@@ -449,9 +594,12 @@ class AsyncEngine(BaseEngine):
                     # initial entry are processed before any external events.
                     if external_event.event == "__initial__":
                         transitions = self._initial_transitions(external_event)
-                        await self._enter_states(
-                            transitions, external_event, OrderedSet(), OrderedSet()
-                        )
+                        if self.compensable:
+                            await self._enter_initial_compensable(transitions, external_event)
+                        else:
+                            await self._enter_states(
+                                transitions, external_event, OrderedSet(), OrderedSet()
+                            )
                         break
 
                     # Finalize + autoforward for active invocations

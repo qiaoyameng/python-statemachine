@@ -643,3 +643,19 @@ True
 If a callback is defined but returns `None` explicitly, it is included in the
 result list. Only callbacks that are not defined at all are excluded.
 ```
+
+(compensable-actions)=
+
+## Compensable actions
+
+When a transition performs several external side effects in sequence
+(reserve, deduct, create), a later failure can require undoing the earlier
+ones. Enable the opt-in **compensable microstep** mode with
+`compensable_microstep = True` and register each action with a compensation
+via {func}`~statemachine.compensable` (or declare it
+{func}`~statemachine.side_effect_free`). On failure, completed actions are
+compensated in reverse order with their original return value as the
+`credential`, and the configuration and history roll back to their
+pre-microstep state. See {ref}`compensable-microsteps` for the full
+reference, including upfront rejection rules and the async cancellation
+path.

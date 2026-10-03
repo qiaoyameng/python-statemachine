@@ -18,6 +18,13 @@ def allways_true(*args, **kwargs):
     return True
 
 
+ACTION_META_ATTR = "_statemachine_action_meta"
+"""Attribute holding compensable-microstep metadata (:class:`ActionMeta`) on a
+user action function. Bound methods proxy attribute access to the underlying
+function, so the metadata survives callback resolution without wrapper
+proxies. See :mod:`statemachine.compensation`."""
+
+
 class CallbackPriority(IntEnum):
     GENERIC = 0
     INLINE = 10
@@ -382,6 +389,11 @@ class CallbacksRegistry:
 
     def __contains__(self, key: str) -> bool:
         return key in self._registry
+
+    def has_callbacks(self, key: str) -> bool:
+        """Whether *key* resolves to an executor with at least one registered callback."""
+        executor = self._registry.get(key)
+        return bool(executor is not None and len(executor.items))
 
     def check(self, specs: CallbackSpecList):
         for meta in specs:

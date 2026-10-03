@@ -43,6 +43,7 @@ GHSA-v4jc-pm6r-3vj8.
 | `enable_self_transition_entries` | `True` | `False` | Execute entry/exit actions on self-transitions |
 | `atomic_configuration_update` | `False` | `True` | When to update {ref}`configuration <querying-configuration>` during a microstep |
 | `catch_errors_as_events` | `True` | `False` | Catch action errors as `error.execution` events |
+| `compensable_microstep` | `False` | `False` | Roll back completed actions on failure; see {ref}`compensable-microsteps` |
 
 Each attribute is described below, with cross-references to the pages that
 cover the topic in depth.

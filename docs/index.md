@@ -33,6 +33,7 @@ guards
 statechart
 processing_model
 error_handling
+compensation
 async
 listeners
 ```
