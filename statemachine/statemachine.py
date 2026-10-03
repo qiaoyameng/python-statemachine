@@ -8,6 +8,8 @@ from typing import TypeVar
 
 from statemachine.orderedset import OrderedSet
 
+from .analysis import AnalysisReport
+from .analysis import analyze_statechart
 from .callbacks import SPECS_ALL
 from .callbacks import SPECS_SAFE
 from .callbacks import CallbackSpecList
@@ -519,6 +521,28 @@ class StateChart(Generic[TModel], metaclass=StateMachineMetaclass):
         completion -- it works for flat, compound, and parallel topologies.
         """
         return not self._engine.running
+
+    @classmethod
+    def analyze_structure(cls, max_configurations: int = 1000) -> AnalysisReport:
+        """Statically analyze the configuration graph of this statechart.
+
+        Reports unreachable states, non-final configurations with no
+        successors, and eventless-transition cycles — expanding hierarchical
+        entry, parallel regions, and history pseudo-states. No user code
+        (guards, validators, actions) is executed: unguarded transitions are
+        certain edges and guarded transitions are unknown, so results
+        distinguish definite from possible (structural) outcomes.
+
+        Args:
+            max_configurations: Maximum number of configurations to explore.
+                When the limit is reached, the report is marked as incomplete
+                (``complete=False``) and contains the partial results known so far.
+
+        .. seealso::
+
+            :func:`statemachine.analysis.analyze_statechart`.
+        """
+        return analyze_statechart(cls, max_configurations=max_configurations)
 
 
 class StateMachine(StateChart):

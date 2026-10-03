@@ -56,6 +56,7 @@ models
 integrations
 weighted_transitions
 timeout
+structural_analysis
 ```
 
 ```{toctree}

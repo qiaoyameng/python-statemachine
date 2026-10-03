@@ -172,3 +172,25 @@ See [](io/index.md) for the guide.
 ```{eval-rst}
 .. autofunction:: statemachine.contrib.timeout.timeout
 ```
+
+## analyze_statechart
+
+```{versionadded} 3.2.2
+```
+
+```{seealso}
+{ref}`structural_analysis` guide.
+```
+
+```{eval-rst}
+.. autofunction:: statemachine.analysis.analyze_statechart
+
+.. autoclass:: statemachine.analysis.AnalysisReport
+    :members:
+
+.. autoclass:: statemachine.analysis.Finding
+    :members:
+
+.. autoclass:: statemachine.analysis.PathStep
+    :members:
+```
