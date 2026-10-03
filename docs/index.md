@@ -44,6 +44,7 @@ listeners
 
 behaviour
 validations
+structural_analysis
 ```
 
 ```{toctree}

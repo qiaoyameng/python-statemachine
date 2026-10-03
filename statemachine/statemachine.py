@@ -283,6 +283,31 @@ class StateChart(Generic[TModel], metaclass=StateMachineMetaclass):
         except KeyError as err:
             raise InvalidStateValue(initial_state_values) from err
 
+    @classmethod
+    def analyze_structure(
+        cls, max_configurations: int = 10_000
+    ) -> "StructureReport":
+        """Run the static structural analysis on this state machine class.
+
+        Reports unreachable states, non-final dead configurations, and cycles
+        made of eventless transitions. The analysis is purely structural: it
+        never instantiates the machine and never evaluates guards, validators,
+        actions, or entry/exit callbacks. Guarded edges are treated as
+        conditions of unknown truth value, producing *possible* results rather
+        than business-level proofs.
+
+        Args:
+            max_configurations: Upper bound on explored configurations; when
+                reached the returned report is marked truncated.
+
+        Returns:
+            A :class:`~statemachine.analysis.StructureReport`.
+        """
+        from .analysis import StructureReport
+        from .analysis import analyze_structure
+
+        return analyze_structure(cls, max_configurations=max_configurations)
+
     def bind_events_to(self, *targets):
         """Bind the state machine events to the target objects."""
 
