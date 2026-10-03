@@ -10,11 +10,16 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
+from ..compensation import CompensationError
+from ..compensation import CompensationScope
+from ..compensation import activate_scope
+from ..compensation import reset_scope
 from ..event import BoundEvent
 from ..event_data import EventData
 from ..event_data import TriggerData
 from ..exceptions import InvalidDefinition
 from ..exceptions import TransitionNotAllowed
+from ..i18n import _
 from ..invoke import InvokeManager
 from ..orderedset import OrderedSet
 from ..state import HistoryState
@@ -96,6 +101,10 @@ class BaseEngine:
         self._log_id = f"[{type(sm).__name__}]"
         self._debug = logger.debug if logger.isEnabledFor(logging.DEBUG) else lambda *a, **k: None
         self._root_parallel_final_pending: "State | None" = None
+        self._compensating: bool = False
+        """Whether the current microstep runs in compensatable mode. While active,
+        per-block ``on_error`` isolation is disabled so action errors abort the
+        microstep and trigger compensation."""
 
     def empty(self):  # pragma: no cover
         return self.external_queue.is_empty()
@@ -139,7 +148,7 @@ class BaseEngine:
         ``error.execution`` on the internal queue.  Otherwise returns ``None``
         so that exceptions propagate normally.
         """
-        if not self.sm.catch_errors_as_events:
+        if not self.sm.catch_errors_as_events or self._compensating:
             return None
 
         def handler(error: Exception) -> None:
@@ -382,6 +391,8 @@ class BaseEngine:
             transitions,
         )
         previous_configuration = self.sm.configuration
+        if self.sm.compensate_on_failure:
+            return self._compensated_microstep(transitions, trigger_data, previous_configuration)
         try:
             result = self._execute_transition_content(
                 transitions, trigger_data, lambda t: t.before.key
@@ -399,6 +410,12 @@ class BaseEngine:
             self._handle_error(e, trigger_data)
             return None
 
+        return self._finalize_microstep(transitions, trigger_data, result)
+
+    def _finalize_microstep(
+        self, transitions: list[Transition], trigger_data: TriggerData, result: list
+    ):
+        """Run the ``after`` content and normalize the microstep result."""
         try:
             self._execute_transition_content(
                 transitions,
@@ -417,6 +434,96 @@ class BaseEngine:
             result = result[0]
 
         return result
+
+    def _compensated_microstep(
+        self,
+        transitions: list[Transition],
+        trigger_data: TriggerData,
+        previous_configuration: OrderedSet[State],
+    ):
+        """Run a microstep in compensatable mode.
+
+        Before executing anything, validates that every user exit/action/entry
+        callback is compensatable or declared ``@pure`` and that no entered
+        state uses ``invoke``. On failure, restores the pre-microstep
+        configuration and history, then runs the compensations of the actions
+        that completed successfully in reverse order.
+        """
+        previous_history = {k: list(v) for k, v in self.sm.history_values.items()}
+        scope = CompensationScope()
+        token = activate_scope(scope)
+        self._compensating = True
+        try:
+            self._validate_compensatable(transitions, previous_configuration)
+            result = self._execute_transition_content(
+                transitions, trigger_data, lambda t: t.before.key
+            )
+            states_to_exit = self._exit_states(transitions, trigger_data)
+            result += self._enter_states(
+                transitions, trigger_data, states_to_exit, previous_configuration
+            )
+        except BaseException as e:
+            self.sm.configuration = previous_configuration
+            self.sm.history_values = previous_history
+            compensation_errors = scope.compensate()
+            if isinstance(e, InvalidDefinition):
+                raise
+            if not isinstance(e, Exception):
+                # Cancellation or keyboard interrupt: compensate, then propagate.
+                raise
+            self._handle_error(self._compensation_error(e, compensation_errors), trigger_data)
+            return None
+        finally:
+            reset_scope(token)
+            self._compensating = False
+
+        return self._finalize_microstep(transitions, trigger_data, result)
+
+    @staticmethod
+    def _compensation_error(error: Exception, compensation_errors: list[Exception]) -> Exception:
+        """Wrap ``error`` in a :class:`CompensationError` if compensations failed."""
+        if not compensation_errors:
+            return error
+        return CompensationError(error, compensation_errors)
+
+    def _validate_compensatable(
+        self, transitions: list[Transition], previous_configuration: OrderedSet[State]
+    ):
+        """Reject a compensated microstep before execution when unsupported.
+
+        Every user exit/action/entry callback participating in the microstep
+        must be compensatable or declared ``@pure``; ``invoke`` on entered
+        states is not supported.
+        """
+        ordered_exit, states_to_exit = self._prepare_exit_states(transitions)
+        ordered_enter, _default_entry, _history_content, _new_config = self._prepare_entry_states(
+            transitions, states_to_exit, previous_configuration
+        )
+
+        problems = []
+        for info in ordered_enter:
+            state = info.state
+            if state is not None and state.invoke.key in self.sm._callbacks:  # pragma: no branch
+                problems.append(f"invoke on state '{state.id}'")
+
+        keys = [info.state.exit.key for info in ordered_exit if info.state is not None]
+        keys += [transition.on.key for transition in transitions]
+        keys += [info.state.enter.key for info in ordered_enter if info.state is not None]
+        for key in keys:
+            if key not in self.sm._callbacks:
+                continue
+            for wrapper in self.sm._callbacks[key]:
+                if wrapper.compensation is None and not wrapper.is_pure_action:
+                    problems.append(f"callback '{wrapper}'")
+
+        if problems:
+            raise InvalidDefinition(
+                _(
+                    "Compensatable microstep rejected: every exit/action/entry callback "
+                    "must be registered with 'compensatable()' or declared '@pure', and "
+                    "'invoke' is not supported. Offenders: {}"
+                ).format(", ".join(problems))
+            )
 
     def _get_args_kwargs(
         self,

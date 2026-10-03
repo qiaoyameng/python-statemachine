@@ -4,6 +4,7 @@ import time
 from datetime import datetime
 
 import pytest
+from statemachine.compensation import pure
 
 
 def pytest_addoption(parser):
@@ -161,6 +162,7 @@ def engine(request):
 class _AsyncListener:
     """No-op async listener that triggers AsyncEngine selection."""
 
+    @pure
     async def on_enter_state(
         self, **kwargs
     ): ...  # No-op: presence of async callback triggers AsyncEngine selection

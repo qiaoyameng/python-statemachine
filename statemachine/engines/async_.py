@@ -5,6 +5,9 @@ from itertools import chain
 from time import time
 from typing import TYPE_CHECKING
 
+from ..compensation import CompensationScope
+from ..compensation import activate_scope
+from ..compensation import reset_scope
 from ..event_data import EventData
 from ..event_data import TriggerData
 from ..exceptions import InvalidDefinition
@@ -291,6 +294,10 @@ class AsyncEngine(BaseEngine):
             transitions,
         )
         previous_configuration = self.sm.configuration
+        if self.sm.compensate_on_failure:
+            return await self._compensated_microstep(
+                transitions, trigger_data, previous_configuration
+            )
         try:
             result = await self._execute_transition_content(
                 transitions, trigger_data, lambda t: t.before.key
@@ -308,6 +315,12 @@ class AsyncEngine(BaseEngine):
             self._handle_error(e, trigger_data)
             return None
 
+        return await self._finalize_microstep(transitions, trigger_data, result)
+
+    async def _finalize_microstep(
+        self, transitions: "list[Transition]", trigger_data: TriggerData, result: list
+    ):
+        """Run the ``after`` content and normalize the microstep result."""
         try:
             await self._execute_transition_content(
                 transitions,
@@ -326,6 +339,48 @@ class AsyncEngine(BaseEngine):
             result = result[0]
 
         return result
+
+    async def _compensated_microstep(
+        self,
+        transitions: "list[Transition]",
+        trigger_data: TriggerData,
+        previous_configuration: "OrderedSet[State]",
+    ):
+        """Async variant of :meth:`BaseEngine._compensated_microstep`.
+
+        Also compensates on cancellation: ``asyncio.CancelledError`` is a
+        ``BaseException``, so it is caught here, compensations run, and the
+        cancellation is then re-raised.
+        """
+        previous_history = {k: list(v) for k, v in self.sm.history_values.items()}
+        scope = CompensationScope()
+        token = activate_scope(scope)
+        self._compensating = True
+        try:
+            self._validate_compensatable(transitions, previous_configuration)
+            result = await self._execute_transition_content(
+                transitions, trigger_data, lambda t: t.before.key
+            )
+            states_to_exit = await self._exit_states(transitions, trigger_data)
+            result += await self._enter_states(
+                transitions, trigger_data, states_to_exit, previous_configuration
+            )
+        except BaseException as e:
+            self.sm.configuration = previous_configuration
+            self.sm.history_values = previous_history
+            compensation_errors = await scope.acompensate()
+            if isinstance(e, InvalidDefinition):
+                raise
+            if not isinstance(e, Exception):
+                # Cancellation: compensate, then propagate.
+                raise
+            self._handle_error(self._compensation_error(e, compensation_errors), trigger_data)
+            return None
+        finally:
+            reset_scope(token)
+            self._compensating = False
+
+        return await self._finalize_microstep(transitions, trigger_data, result)
 
     # --- Engine loop ---
 

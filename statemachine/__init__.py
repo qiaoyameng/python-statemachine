@@ -1,3 +1,6 @@
+from .compensation import CompensationError
+from .compensation import compensatable
+from .compensation import pure
 from .event import Event
 from .state import HistoryState
 from .state import HistoryType
@@ -18,4 +21,7 @@ __all__ = [
     "HistoryType",
     "Event",
     "TModel",
+    "CompensationError",
+    "compensatable",
+    "pure",
 ]

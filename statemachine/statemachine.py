@@ -104,6 +104,17 @@ class StateChart(Generic[TModel], metaclass=StateMachineMetaclass):
     produce an ``error.execution`` internal event instead of propagating, as mandated by the
     SCXML specification. If ``False``, exceptions propagate normally."""
 
+    compensate_on_failure: bool = False
+    """If ``True``, each microstep runs in compensatable mode: user
+    ``exit``/``on``/``enter`` callbacks must be registered with
+    :func:`compensatable` or declared side-effect-free with ``@pure``, and
+    ``invoke`` is rejected before execution. When an action fails, the
+    compensations of the actions that completed successfully within the
+    microstep run in reverse order (each receiving the credential returned by
+    its action), and the active configuration and history are restored to
+    their pre-microstep values. Default ``False`` keeps the existing
+    exception semantics."""
+
     start_configuration_values: list[Any] = []
     """Default state values to be entered when the state machine starts.
 

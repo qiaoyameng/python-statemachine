@@ -11,6 +11,7 @@ from .callbacks import SPECS_ALL
 from .callbacks import SpecReference
 from .callbacks import allways_true
 from .event import Event
+from .exceptions import AttrNotFound
 from .exceptions import InvalidDefinition
 from .i18n import _
 from .signature import SignatureAdapter
@@ -80,8 +81,34 @@ class Listeners:
                 continue
 
             executor = registry[specs.grouper(spec.group).key]
+            compensation = (
+                self._resolve_compensation(spec.compensation)
+                if spec.compensation is not None
+                else None
+            )
             for key, builder in self.build(spec):
-                executor.add(key, spec, builder)
+                executor.add(key, spec, builder, compensation=compensation)
+
+    def _resolve_compensation(self, compensation) -> Callable:
+        """Resolve a compensation spec (name or callable) into a callable.
+
+        Names are resolved on the machine/model/listeners like any other
+        callback; unbound functions are rebound to the object that provides
+        them so ``self`` works as expected.
+        """
+        if isinstance(compensation, str):
+            for _key, builder in self.search_name(compensation):
+                return builder()
+            raise AttrNotFound(
+                _("Did not found name '{}' from model or statemachine").format(compensation)
+            )
+        if not hasattr(compensation, "__self__"):
+            for listener in self.items:
+                bound = getattr(listener.obj, getattr(compensation, "__name__", ""), None)
+                if getattr(bound, "__func__", None) is compensation:
+                    compensation = bound
+                    break
+        return callable_method(compensation)
 
     def _take_callback(self, name: str, names_not_found_handler: Callable) -> Callable:
         callbacks: list[Callable] = []
@@ -211,6 +238,8 @@ def callable_method(a_callable) -> Callable:
     signature_adapter.__name__ = metadata_to_copy.__name__
     signature_adapter.__doc__ = metadata_to_copy.__doc__
     signature_adapter.is_coroutine = sig.is_coroutine  # type: ignore[attr-defined]
+    is_pure_action = getattr(a_callable, "is_pure_action", False)
+    signature_adapter.is_pure_action = is_pure_action  # type: ignore[attr-defined]
 
     return signature_adapter
 

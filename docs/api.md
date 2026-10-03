@@ -101,6 +101,13 @@
     :members:
 ```
 
+## Compensation
+
+```{eval-rst}
+.. automodule:: statemachine.compensation
+    :members: compensatable, pure, Compensatable, CompensationError, CompensationScope
+```
+
 ## Callback conventions
 
 These are convention-based callbacks that you can define on your state machine

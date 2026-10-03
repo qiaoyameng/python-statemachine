@@ -9,6 +9,8 @@ from enum import auto
 from functools import partial
 from inspect import isawaitable
 
+from .compensation import Compensatable
+from .compensation import current_scope
 from .exceptions import AttrNotFound
 from .i18n import _
 from .utils import ensure_iterable
@@ -73,6 +75,10 @@ class CallbackSpec:
         priority: CallbackPriority = CallbackPriority.NAMING,
         expected_value=None,
     ):
+        self.compensation = None
+        if isinstance(func, Compensatable):
+            self.compensation = func.compensation
+            func = func.action
         self.func = func
         self.group = group
         self.is_convention = is_convention
@@ -228,6 +234,7 @@ class CallbackWrapper:
         condition: Callable,
         meta: "CallbackSpec",
         unique_key: str,
+        compensation: "Callable | None" = None,
     ) -> None:
         self._callback = callback
         self._iscoro = getattr(callback, "is_coroutine", False)
@@ -235,6 +242,11 @@ class CallbackWrapper:
         self.meta = meta
         self.unique_key = unique_key
         self.expected_value = self.meta.expected_value
+        self.compensation = compensation
+        """Resolved compensation callable, when the action was registered
+        with :func:`compensatable`."""
+        self.is_pure_action = getattr(callback, "is_pure_action", False)
+        """Whether the callback was declared side-effect-free with ``@pure``."""
 
     def __repr__(self):
         return f"{type(self).__name__}({self.unique_key})"
@@ -250,15 +262,25 @@ class CallbackWrapper:
         if isawaitable(value):
             value = await value
 
+        self._track_compensation(value)
         if self.expected_value is not None:
             return bool(value) == self.expected_value
         return value
 
     def call(self, *args, **kwargs):
         value = self._callback(*args, **kwargs)
+        self._track_compensation(value)
         if self.expected_value is not None:
             return bool(value) == self.expected_value
         return value
+
+    def _track_compensation(self, value):
+        """Push the compensation with the action's credential on the active scope."""
+        if self.compensation is None:
+            return
+        scope = current_scope()
+        if scope is not None:
+            scope.push(self.compensation, value)
 
 
 class CallbacksExecutor:
@@ -277,7 +299,13 @@ class CallbacksExecutor:
     def __str__(self):
         return ", ".join(str(c) for c in self)
 
-    def add(self, key: str, spec: CallbackSpec, builder: Callable[[], Callable]):
+    def add(
+        self,
+        key: str,
+        spec: CallbackSpec,
+        builder: Callable[[], Callable],
+        compensation: "Callable | None" = None,
+    ):
         if key in self.items_already_seen:
             return
 
@@ -289,6 +317,7 @@ class CallbacksExecutor:
             condition=condition,
             meta=spec,
             unique_key=key,
+            compensation=compensation,
         )
 
         insort(self.items, wrapper)
